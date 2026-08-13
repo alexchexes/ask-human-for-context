@@ -83,7 +83,7 @@ dev = [
 ]
 
 [tool.uv]
-required-version = "==0.11.25"
+required-version = ">=0.11.25,<0.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

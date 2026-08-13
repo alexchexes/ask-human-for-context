@@ -10,3 +10,4 @@ scratchpad/
 .venv
 .history/
 /tmp
+.DS_Store

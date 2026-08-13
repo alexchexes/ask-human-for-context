@@ -91,7 +91,7 @@ def test_dev_setup_tooling_is_consistent():
 
 
 def test_dependency_version_policy_is_explicit():
-    """Require reviewed compatibility bounds and exact build/bootstrap tool versions."""
+    """Require reviewed compatibility bounds for dependencies and build tools."""
     pyproject_path = os.path.join(ROOT_DIR, "pyproject.toml")
     with open(pyproject_path, encoding="utf-8") as pyproject_file:
         pyproject_text = pyproject_file.read()
@@ -104,7 +104,7 @@ def test_dependency_version_policy_is_explicit():
         == EXPECTED_RUNTIME_REQUIREMENTS
     )
     assert 'requires-python = ">=3.10,<4"' in pyproject_text
-    assert 'required-version = "==0.11.25"' in pyproject_text
+    assert 'required-version = ">=0.11.25,<0.12"' in pyproject_text
 
 
 def test_readme_documents_locked_dev_environment():

@@ -60,7 +60,7 @@ And Codex (or your agent of choice) will do just that, because it now has a well
 
 ## Installation
 
-### Recommended: No installation, use uvx
+### uvx (no installation; recommended)
 
 `uvx` is the recommended way to run Ask Human from an MCP client. It does not require a prior install: it downloads the `ask-human` package on first invocation, caches it, and runs it in an isolated environment.
 
@@ -71,7 +71,7 @@ command: uvx
 args: ask-human --transport stdio
 ```
 
-See [MCP Client Setup](#mcp-client-setup) for exact setup with `uvx` for popular clients.
+See [MCP Client Setup](#mcp-client-setup) for exact setup instructions with `uvx` for popular clients.
 
 > To manually run the CLI directly:
 >
@@ -128,94 +128,130 @@ After updating, restart any active MCP client sessions so they launch the new As
 
 Codex, Claude Code, Cursor, and other MCP-capable agent clients can use Ask Human by adding the MCP server to their config.
 
+See [Command args reference](#command-args-reference).
+
 > **NOTE**: Examples below use `ask-human` consistently as the package name, executable name, and MCP server name. Keeping those names aligned is intentional and recommended, though the MCP server name is configurable in your client.
 
 > **NOTE**: It is also recommended to increase your client's MCP tool-call timeout as much as practical, so you avoid a situation where the agent asks something important, the MCP call times out, and the agent goes back to assumptions / inferring.
 
 ### Codex
 
-> **Important:** For Codex CLI `0.142.0-alpha.1+` (bundled in VS Code extension `26.616.30709+` and, approximately, Codex app builds from the `26.616.*` release family onward), you must also add the `[features.code_mode]` entry below. It keeps `Ask Human` outside the new code-mode `exec` wrapper, which allows the model to terminate the call before you answer ([openai/codex#29122](https://github.com/openai/codex/issues/29122)). If unsure, check `cli_version` in the first `session_meta` line of your newest `~/.codex/sessions/.../rollout-*.jsonl` file.
-
 > Codex MCP docs: <https://developers.openai.com/codex/mcp>
 
-#### Using Codex CLI `mcp add`:
-
-Using `uvx` (no install step):
-
-```bash
-codex mcp add ask-human -- uvx ask-human --transport stdio
-```
-
-Or if you installed using `pip` / `pipx`:
-
-```bash
-codex mcp add ask-human -- ask-human --transport stdio
-```
-
-#### Or manually add `config.toml` entry:
-
-Open your `~/.codex/config.toml` and add a new entry:
+Add MCP config to your `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.ask-human]
 command = "uvx"
-args = ["ask-human", "--transport", "stdio"]
+args = [
+  "ask-human",
+  "--transport", "stdio",
 
-# Codex CLI v0.142.0-alpha.1+ / VS Code extension v26.616.30709+
+  "--timeout-seconds", "86400", # human reply window; 86400 = 24 h
+
+  # configure Telegram if needed:
+  # "--response-channel", "both", # dialog | telegram | both
+  # "--telegram", "<bot_token> <chat_id>", # creds for your personal tg bot used ONLY ON THIS MACHINE
+
+  # Customize OS dialogue title
+  # "--dialog-title", "Codex asks..."
+
+  # Show remaining time to answer
+  # "--show-timing-info",
+]
+
+tool_timeout_sec = 86460 # client timeout. Should be larger than the reply window
+
+# Work around sometimes-broken Codex thread `cwd`, or a macOS VS Code permissions problem
+# cwd = "C:\\" # Windows
+# cwd = "/" # macOS/Linux
+
+# Prevent Codex startup if Ask Human cannot initialize
+required = true
+
+# For Codex CLI v0.142+ / VS Code extension v26.616.30709+ - prevent this MCP
+# from running through "code_mode exec" mode
 [features.code_mode]
 direct_only_tool_namespaces = ["mcp__ask_human"]
-
 ```
 
-Configuration is done by adding other `args`; see [Configuration](#configuration) for available options.
-
-Restart any active Codex sessions after adding the MCP server or changing config. If you use the VS Code extension, use "Reload Window" or "Restart Extension Host".
+Restart Codex after changing the config. In VS Code, use "Reload Window" or "Restart Extension Host".
 
 ### Claude Code
 
-- Claude Code MCP docs: <https://docs.anthropic.com/en/docs/claude-code/mcp>
+> Claude Code MCP docs: <https://code.claude.com/docs/en/mcp>
 
-One typical setup is to add the server through the Claude Code MCP command:
+Add to `~/.claude.json`:
 
-```bash
-claude mcp add --transport stdio ask-human -- uvx ask-human --transport stdio
+```jsonc
+{
+  // your existing config...
+  "mcpServers": {
+    // your existing MCP servers...
+    // ...
+    "ask-human": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "ask-human",
+        "--transport", "stdio",
+        "--timeout-seconds", "86400",
+        "--show-timing-info",
+        "--dialog-title", "Claude asks...",
+
+        // Set up Telegram
+        // "--telegram", "<bot_token> <chat_id>",
+        // "--response-channel", "both" // or "telegram" only.
+      ],
+      "timeout": 86460000
+    }
+  }
+}
 ```
+
+`timeout` is Claude's per-server tool-call timeout in milliseconds. Its value should be slightly larger than `--timeout-seconds`, which uses seconds. The example above configures a 24-hour reply window and a client timeout one minute longer.
+
+Additionally, [Claude now automatically moves long MCP calls to the background](https://code.claude.com/docs/en/mcp#automatic-backgrounding-of-long-tool-calls), which allows it to continue before your reply arrives. To make Claude keep waiting for MCP calls until they return or reach their configured timeout, add this to `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"
+  }
+}
+```
+
+Note that this disables automatic backgrounding of any MCP calls, not just `ask-human`.
 
 ### Cursor
 
-- Cursor MCP docs: <https://docs.cursor.com/context/model-context-protocol>
+> Cursor MCP docs: <https://cursor.com/docs/mcp>
 
-Add this to your Cursor MCP config:
+Example for `~/.cursor/mcp.json`:
 
-```json
+```jsonc
 {
   "mcpServers": {
     "ask-human": {
+      "type": "stdio",
       "command": "uvx",
-      "args": ["ask-human", "--transport", "stdio"]
+      "args": [
+        "ask-human",
+        "--transport", "stdio",
+        "--timeout-seconds", "86400",
+        "--show-timing-info",
+        "--dialog-title", "Agent asks...",
+
+        // Set up Telegram
+        // "--telegram", "<bot_token> <chat_id>",
+        // "--response-channel", "both" // or "telegram" only.
+      ]
     }
   }
 }
 ```
 
-### Local Development
-
-```json
-{
-  "mcpServers": {
-    "ask-human-dev": {
-      "command": "python",
-      "args": ["-m", "ask_human", "--transport", "stdio"],
-      "cwd": "/path/to/ask-human",
-      "env": {
-        "PYTHONPATH": "/path/to/ask-human/src"
-      }
-    }
-  }
-}
-```
-
-The included `mcp-server-config.json` has copyable examples for installed, `uvx`, and local-dev usage.
+Cursor's current MCP documentation does not document a per-server tool timeout.
 
 ## AGENTS.md instructions
 
@@ -229,14 +265,14 @@ the `ask_human` tool before proceeding.
 
 <details>
 
-<summary><b>Full tested AGENTS.md instruction example</b></summary>
+<summary><b>Battle-tested AGENTS.md instruction example</b></summary>
 
 ```md
 ## Ask human tool
 
 If a missing fact, design choice, or user preference is not 100% clear, and a wrong
 assumption could materially affect correctness, safety, architecture, or user intent,
-use `ask_human` mcp/tool before proceeding.
+use the `ask_human` MCP/tool before proceeding.
 
 If the tool is unavailable or times out without a human response, do not proceed
 and do not roll back changes unless it is absolutely necessary (e.g. a broken
@@ -258,7 +294,7 @@ but include necessary context details
 so the user is properly informed.
 
 When a task requires many decisions from the user, or when the user explicitly asks
-you to ask questions or use `ask_human` tool, do not limit that to the initial planning phase.
+you to ask questions or use `ask_human`, do not limit that to the initial planning phase.
 Continue talking with the user via that tool during implementation whenever a new assumption,
 design choice, external value, or behavior decision appears that was not already answered.
 Do not treat early answers as broad permission to infer the remaining details silently.
@@ -272,7 +308,7 @@ Briefly explain the conflict using `ask_human`.
 If the request seems technically wrong, unsafe, or likely to cause unintended consequences,
 always use `ask_human` to confirm that the user really means it before proceeding.
 
-Common source of confusion: the user may think they're on one branch or workspace
+A common source of confusion: the user may think they're on one branch or workspace
 when they're actually on another.
 ```
 
@@ -286,15 +322,15 @@ To increase the chance that the agent asks before making a wrong assumption, add
 ...<your normal prompt>...
 
 P.S. Remember to use the ask_human tool whenever you hit any ambiguity, uncertainty,
-non-obvious implications, something that is not 100% explicitly agreed, or for any
-other reason requires or might require my input. Never infer or make assumptions
-(even "conservative") in such cases, use `ask_human` tool instead (or stop if tool
-is unavailable or does not return usable output).
+non-obvious implications, something that is not 100% explicitly agreed, or anything
+else that requires or might require my input. Never infer or make assumptions
+(even "conservative" ones) in such cases; use the `ask_human` tool instead (or stop if
+the tool is unavailable or does not return usable output).
 ```
 
 ## Configuration
 
-### Telegram as response channel
+### Telegram as a response channel
 
 To make your agent message you via Telegram when it needs your input, add:
 
@@ -309,7 +345,11 @@ When you receive an agent prompt, you can respond with text, a photo, another me
 Telegram prompts render common agent Markdown, such as bold, italic, inline code, fenced code blocks, links, headings, quotes, and lists, through Telegram-supported HTML. The prompt metadata remains in an expandable Telegram quote block. If Telegram rejects the formatting, the same prompt is retried as plain text so the message is still delivered.
 
 <details>
-<summary>How to create a Telegram bot and obtain chat ID</summary>
+<summary>
+
+#### How to create a Telegram bot and obtain a chat ID
+
+</summary>
 
 1. Open Telegram and message `@BotFather`.
 2. Run `/newbot` and follow BotFather's prompts.
@@ -328,13 +368,17 @@ For a group chat, add the bot to the group, send a message in the group, then ca
 
 </details>
 
-See [Icons for Telegram bot](https://github.com/alexchexes/ask-human/tree/main/src/ask_human/assets/telegram).
+See [Telegram bot icons](https://github.com/alexchexes/ask-human/tree/main/src/ask_human/assets/telegram).
 
 **Important:** If you run agents on different machines or inside different VMs, you must use a **different Telegram bot token for each machine/environment**. That limitation is due to how Telegram's `getUpdates` mechanism works. Using the same bot for different environments may be buggy and unreliable.
 
 <details>
 
-<summary>How Telegram broker works</summary>
+<summary>
+
+#### How Telegram broker works
+
+</summary>
 
 Telegram delivery uses a local auto-started broker process instead of letting each agent session poll `getUpdates` independently.
 
@@ -394,7 +438,7 @@ Telegram reply behavior:
 - albums/media groups are combined into one agent-facing response
 - short bursts of ungrouped file/media replies are combined too, so multiple screenshots or documents can be sent even when Telegram's `Group items` option is disabled
 - for many or delayed attachments, reply with `/files_start`, send the items as normal Telegram messages, then send `/files_finish`; use `/files_cancel` to discard the collected items and keep the prompt waiting
-- if a local broker is actively waiting and you send a non-reply message, it sends a short warning that the message is ignored and you must use Reply;
+- if a local broker is actively waiting and you send a non-reply message, it sends a short warning that the message is ignored and you must use Reply
 - if you reply to a message that is not the currently active question, it sends a warning instead of silently consuming the reply
 - if you reply to one of this broker's own older inactive prompt messages, it sends a short warning that the old question is no longer active
 - successful replies get a `Received [Prompt ID]` acknowledgement
@@ -417,83 +461,6 @@ files_cancel - Cancel the current attachment collection
 ```
 
 </details>
-
-### Config stubs
-
-#### Codex config stub:
-
-Template for your `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.ask-human]
-command = "uvx"
-args = [
-  "ask-human",
-  "--transport", "stdio",
-  "--timeout-seconds", "3600", # human reply window; 3600 = 1 h
-  "--show-timing-info", # show remaining time to answer
-  "--response-channel", "both", # dialog | telegram | both
-  "--telegram", "<bot_token> <chat_id>", # creds for your personal tg bot used ONLY ON THIS MACHINE
-  "--dialog-title", "Codex asks..." # Custom OS dialogue title
-]
-# keep client timeout slightly larger than Ask Human's reply window
-tool_timeout_sec = 3660 # 1 h + 1 min
-
-# Codex CLI v0.142.0-alpha.1+ / VS Code extension v26.616.30709+
-[features.code_mode]
-direct_only_tool_namespaces = ["mcp__ask_human"]
-```
-
-#### Claude Code config stub:
-
-Project-scoped `.mcp.json` equivalent:
-
-```json
-{
-  "mcpServers": {
-    "ask-human": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "ask-human",
-        "--transport", "stdio",
-        "--timeout-seconds", "3600",
-        "--show-timing-info",
-        "--response-channel", "both",
-        "--telegram", "<bot_token> <chat_id>",
-        "--dialog-title", "Claude asks..."
-      ],
-      "timeout": 3660000
-    }
-  }
-}
-```
-
-`timeout` is Claude Code's per-server tool-call timeout in milliseconds.
-
-#### Cursor config stub:
-
-Project-local `.cursor/mcp.json` or global `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "ask-human": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "ask-human",
-        "--transport", "stdio",
-        "--timeout-seconds", "3600",
-        "--show-timing-info",
-        "--response-channel", "both",
-        "--telegram", "<bot_token> <chat_id>",
-        "--dialog-title", "Cursor asks..."
-      ]
-    }
-  }
-}
-```
 
 ### Command args reference
 
@@ -577,7 +544,7 @@ Parameters:
 - `question` (string, required): specific question or request
 - `context` (string, optional): background shown before the question
 
-`question` and `context` may contain up to 8000 characters combined. Long Telegram prompts are split across messages automatically; Windows dialogs wrap long lines best-effort but are not scrollable yet.
+`question` and `context` may contain up to 8000 characters combined. Long Telegram prompts are split across messages automatically; Windows dialogs wrap long lines on a best-effort basis but are not scrollable yet.
 
 Returns one of:
 
@@ -599,17 +566,63 @@ ask_human(
 
 ## Development
 
-Requires Python 3.10+, and also:
+Clone the repo:
 
-- macOS: `osascript`
-- Linux: `zenity`
-- Windows: `tkinter`
+```bash
+git clone https://github.com/alexchexes/ask-human.git
+cd ask-human
+```
 
-Install for development with the repository-pinned uv version and dependency lock:
+Make sure you have [uv](https://docs.astral.sh/uv/) `>=0.11.25, <0.12`. Check with `uv --version` and install a supported version if needed:
+
+- Windows:
+  ```powershell
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.11.25/install.ps1 | iex"
+  ```
+
+- macOS/Linux:
+  ```bash
+  curl -LsSf https://astral.sh/uv/0.11.25/install.sh | sh
+  ```
+
+Create `.venv` and install the project with its dependencies:
 
 ```bash
 uv sync --locked --all-extras
 ```
+
+Configure your MCP client to run from the local checkout. To do that, follow [MCP client setup](#mcp-client-setup), then:
+
+- Replace the `command` value with the absolute path to the `.venv` Python executable:
+  - Windows: `D:\PATH\TO\ask-human\.venv\Scripts\python.exe`
+  - macOS/Linux: `/PATH/TO/ask-human/.venv/bin/python`
+- Replace the first argument (`"ask-human"`) with `"-m", "ask_human"`.
+
+For example:
+
+```toml
+# ~/.codex/config.toml
+
+[mcp_servers.ask-human]
+command = "D:\\PATH\\TO\\ask-human\\.venv\\Scripts\\python.exe" # macOS/Linux: .../.venv/bin/python
+args = [
+  "-m", "ask_human",
+  "--transport", "stdio",
+  # ...the remaining args...
+]
+```
+
+### Local dialog development
+
+The `dialog` and `both` response channels use `osascript` on macOS and `tkinter` on Windows; these normally require no separate installation. Linux uses `zenity`, which requires a graphical desktop session and may need to be installed:
+
+```bash
+sudo apt install zenity     # Debian/Ubuntu
+sudo dnf install zenity     # Fedora
+sudo pacman -S zenity       # Arch
+```
+
+These platform tools are not needed for Telegram-only development, checks, or builds.
 
 When changing Telegram broker/client code during local development, stop any running local Telegram broker before retesting. Otherwise the detached broker may keep running old code from before your edit. See [How Telegram broker works](#how-telegram-broker-works) for the Windows stop command.
 
@@ -630,9 +643,8 @@ uv run --locked python -m build
 uv run --locked python -m twine check dist/*
 ```
 
-`pyproject.toml` requires the exact uv version used by CI. Locked commands fail instead of
-silently changing `uv.lock`. To update a dependency intentionally, edit its reviewed bounds
-in `pyproject.toml`, then run `uv lock --upgrade-package <package>`.
+To update a dependency intentionally, edit its reviewed bounds in `pyproject.toml`, then run
+`uv lock --upgrade-package <package>`.
 
 ## Troubleshooting
 
@@ -643,7 +655,7 @@ If Telegram messages appear delayed, that may be a Telegram-side issue; see [[1]
 You can enable Telegram debug logging either by adding a CLI argument to your MCP config:
 
 ```bash
---telegram-debug-log "{cwd}/tmp/ask-human-telegram-debug.jsonl"
+--telegram-debug-log "~/.ask-human/telegram-debug.jsonl"
 ```
 
 or by launching the broker manually with `ASK_HUMAN_TELEGRAM_DEBUG_LOG=/path/to/ask-human-telegram-debug.jsonl`. The debug log omits bot tokens, chat IDs, prompt text, and reply text.
