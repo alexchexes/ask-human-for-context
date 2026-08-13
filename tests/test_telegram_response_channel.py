@@ -844,53 +844,406 @@ def test_telegram_client_combines_split_text_replies_across_update_pages(
     monkeypatch,
     tmp_path,
 ):
-    """Keep a likely split text reply pending long enough for the next poll."""
+    """Wait for a delayed post-part poll instead of resolving on elapsed time alone."""
     monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_MIN_LENGTH", 10)
-    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.5)
-    client = TelegramPromptClient(
-        TelegramConfig("123456:ABCDEF", "-1009876543210"),
-        tmp_path,
-    )
-    updates = [
-        [
-            {
-                "update_id": 1,
-                "message": {
-                    "message_id": 201,
-                    "chat": {"id": -1009876543210},
-                    "reply_to_message": {"message_id": 101},
-                    "text": "first-long",
-                },
-            }
-        ],
-        [
-            {
-                "update_id": 2,
-                "message": {
-                    "message_id": 202,
-                    "chat": {"id": -1009876543210},
-                    "reply_to_message": {"message_id": 101},
-                    "text": " final",
-                },
-            }
-        ],
-        [],
-    ]
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.01)
 
-    async def fake_bot_api_request(method, payload, timeout):
-        if method == "sendMessage":
-            if "parse_mode" in payload:
-                return {"message_id": 101}
-            return {"message_id": 301}
-        if method == "getUpdates":
-            return updates.pop(0) if updates else []
-        raise AssertionError(f"Unexpected method: {method}")
+    async def run_test():
+        client = TelegramPromptClient(
+            TelegramConfig("123456:ABCDEF", "-1009876543210"),
+            tmp_path,
+        )
+        delayed_poll_started = asyncio.Event()
+        release_delayed_poll = asyncio.Event()
+        poll_calls = 0
 
-    monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+        async def fake_bot_api_request(method, payload, timeout):
+            nonlocal poll_calls
+            if method == "sendMessage":
+                if "parse_mode" in payload:
+                    return {"message_id": 101}
+                return {"message_id": 301}
+            if method == "getUpdates":
+                poll_calls += 1
+                if poll_calls == 1:
+                    return [
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 201,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": "first-long",
+                            },
+                        }
+                    ]
+                if poll_calls == 2:
+                    delayed_poll_started.set()
+                    await release_delayed_poll.wait()
+                    return [
+                        {
+                            "update_id": 2,
+                            "message": {
+                                "message_id": 202,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": " final",
+                            },
+                        }
+                    ]
+                return []
+            raise AssertionError(f"Unexpected method: {method}")
 
-    result = asyncio.run(client.ask_question("Prompt text", 5, "QTEST-1234"))
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
 
-    assert result == "first-long final"
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 5, "QTEST-1234"))
+        await delayed_poll_started.wait()
+        await asyncio.sleep(0.03)
+
+        assert prompt_task.done() is False
+
+        release_delayed_poll.set()
+        assert await prompt_task == "first-long final"
+
+    asyncio.run(run_test())
+
+
+def test_telegram_client_resolves_single_long_reply_after_processed_post_part_poll(
+    monkeypatch,
+    tmp_path,
+):
+    """An empty successful poll after a long part confirms that collection can finish."""
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_MIN_LENGTH", 10)
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.01)
+
+    async def run_test():
+        client = TelegramPromptClient(
+            TelegramConfig("123456:ABCDEF", "-1009876543210"),
+            tmp_path,
+        )
+        confirmation_poll_started = asyncio.Event()
+        release_confirmation_poll = asyncio.Event()
+        poll_calls = 0
+
+        async def fake_bot_api_request(method, payload, timeout):
+            nonlocal poll_calls
+            if method == "sendMessage":
+                if "parse_mode" in payload:
+                    return {"message_id": 101}
+                return {"message_id": 301}
+            if method == "getUpdates":
+                poll_calls += 1
+                if poll_calls == 1:
+                    return [
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 201,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": "single-long",
+                            },
+                        }
+                    ]
+                if poll_calls == 2:
+                    confirmation_poll_started.set()
+                    await release_confirmation_poll.wait()
+                return []
+            raise AssertionError(f"Unexpected method: {method}")
+
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 5, "QTEST-1234"))
+        await confirmation_poll_started.wait()
+        await asyncio.sleep(0.03)
+
+        assert prompt_task.done() is False
+
+        release_confirmation_poll.set()
+        assert await prompt_task == "single-long"
+
+    asyncio.run(run_test())
+
+
+def test_telegram_client_does_not_count_failed_post_part_poll(monkeypatch, tmp_path):
+    """Require a successful post-part poll after a retryable polling failure."""
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_MIN_LENGTH", 10)
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.01)
+    monkeypatch.setattr(TelegramPromptClient, "POLL_RETRY_DELAYS_SECONDS", (0.0,))
+
+    async def run_test():
+        client = TelegramPromptClient(
+            TelegramConfig("123456:ABCDEF", "-1009876543210"),
+            tmp_path,
+        )
+        failed_poll_started = asyncio.Event()
+        release_failed_poll = asyncio.Event()
+        successful_poll_started = asyncio.Event()
+        release_successful_poll = asyncio.Event()
+        poll_calls = 0
+
+        async def fake_bot_api_request(method, payload, timeout):
+            nonlocal poll_calls
+            if method == "sendMessage":
+                if "parse_mode" in payload:
+                    return {"message_id": 101}
+                return {"message_id": 301}
+            if method == "getUpdates":
+                poll_calls += 1
+                if poll_calls == 1:
+                    return [
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 201,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": "single-long",
+                            },
+                        }
+                    ]
+                if poll_calls == 2:
+                    failed_poll_started.set()
+                    await release_failed_poll.wait()
+                    raise TelegramBotApiError(
+                        "Telegram getUpdates request failed: timed out",
+                        method="getUpdates",
+                        transport_error=True,
+                    )
+                if poll_calls == 3:
+                    successful_poll_started.set()
+                    await release_successful_poll.wait()
+                return []
+            raise AssertionError(f"Unexpected method: {method}")
+
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 5, "QTEST-1234"))
+        await failed_poll_started.wait()
+        await asyncio.sleep(0.03)
+        assert prompt_task.done() is False
+
+        release_failed_poll.set()
+        await successful_poll_started.wait()
+        await asyncio.sleep(0)
+        assert prompt_task.done() is False
+
+        release_successful_poll.set()
+        assert await prompt_task == "single-long"
+
+    asyncio.run(run_test())
+
+
+def test_telegram_client_requires_new_poll_after_each_long_part(monkeypatch, tmp_path):
+    """A later likely split part restarts the post-part poll requirement."""
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_MIN_LENGTH", 10)
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.01)
+
+    async def run_test():
+        client = TelegramPromptClient(
+            TelegramConfig("123456:ABCDEF", "-1009876543210"),
+            tmp_path,
+        )
+        third_poll_started = asyncio.Event()
+        release_third_poll = asyncio.Event()
+        poll_calls = 0
+
+        async def fake_bot_api_request(method, payload, timeout):
+            nonlocal poll_calls
+            if method == "sendMessage":
+                if "parse_mode" in payload:
+                    return {"message_id": 101}
+                return {"message_id": 301}
+            if method == "getUpdates":
+                poll_calls += 1
+                if poll_calls in (1, 2):
+                    message_id = 200 + poll_calls
+                    return [
+                        {
+                            "update_id": poll_calls,
+                            "message": {
+                                "message_id": message_id,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": "first-long" if poll_calls == 1 else "second-long",
+                            },
+                        }
+                    ]
+                if poll_calls == 3:
+                    third_poll_started.set()
+                    await release_third_poll.wait()
+                return []
+            raise AssertionError(f"Unexpected method: {method}")
+
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 5, "QTEST-1234"))
+        await third_poll_started.wait()
+        await asyncio.sleep(0.03)
+
+        assert prompt_task.done() is False
+
+        release_third_poll.set()
+        assert await prompt_task == "first-long\nsecond-long"
+
+    asyncio.run(run_test())
+
+
+def test_telegram_client_waits_until_entire_post_part_page_is_processed(
+    monkeypatch,
+    tmp_path,
+):
+    """A successful getUpdates response qualifies only after all its updates are handled."""
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_MIN_LENGTH", 10)
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.01)
+
+    async def run_test():
+        client = TelegramPromptClient(
+            TelegramConfig("123456:ABCDEF", "-1009876543210"),
+            tmp_path,
+        )
+        page_processing_started = asyncio.Event()
+        release_page_processing = asyncio.Event()
+        poll_calls = 0
+        original_handle_update = client._handle_update
+
+        async def controlled_handle_update(update):
+            if update.get("update_id") == 2:
+                page_processing_started.set()
+                await release_page_processing.wait()
+            await original_handle_update(update)
+
+        async def fake_bot_api_request(method, payload, timeout):
+            nonlocal poll_calls
+            if method == "sendMessage":
+                if "parse_mode" in payload:
+                    return {"message_id": 101}
+                return {"message_id": 301}
+            if method == "getUpdates":
+                poll_calls += 1
+                if poll_calls == 1:
+                    return [
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 201,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": "single-long",
+                            },
+                        }
+                    ]
+                if poll_calls == 2:
+                    return [{"update_id": 2}]
+                return []
+            raise AssertionError(f"Unexpected method: {method}")
+
+        monkeypatch.setattr(client, "_handle_update", controlled_handle_update)
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 5, "QTEST-1234"))
+        await page_processing_started.wait()
+        await asyncio.sleep(0.03)
+
+        assert prompt_task.done() is False
+
+        release_page_processing.set()
+        assert await prompt_task == "single-long"
+
+    asyncio.run(run_test())
+
+
+def test_telegram_client_tracks_post_part_polls_per_prompt(monkeypatch, tmp_path):
+    """One shared polling page can finish split collection differently per prompt."""
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_MIN_LENGTH", 10)
+    monkeypatch.setattr(TelegramPromptClient, "TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS", 0.01)
+
+    async def run_test():
+        client = TelegramPromptClient(
+            TelegramConfig("123456:ABCDEF", "-1009876543210"),
+            tmp_path,
+        )
+        release_first_poll = asyncio.Event()
+        second_poll_started = asyncio.Event()
+        release_second_poll = asyncio.Event()
+        poll_calls = 0
+
+        async def fake_bot_api_request(method, payload, timeout):
+            nonlocal poll_calls
+            if method == "sendMessage":
+                if payload["text"] == "Prompt one":
+                    return {"message_id": 101}
+                if payload["text"] == "Prompt two":
+                    return {"message_id": 102}
+                return {"message_id": 301}
+            if method == "getUpdates":
+                poll_calls += 1
+                if poll_calls == 1:
+                    await release_first_poll.wait()
+                    return [
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 201,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": "first-long",
+                            },
+                        },
+                        {
+                            "update_id": 2,
+                            "message": {
+                                "message_id": 202,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 102},
+                                "text": "second-long",
+                            },
+                        },
+                    ]
+                if poll_calls == 2:
+                    second_poll_started.set()
+                    await release_second_poll.wait()
+                    return [
+                        {
+                            "update_id": 3,
+                            "message": {
+                                "message_id": 203,
+                                "chat": {"id": -1009876543210},
+                                "reply_to_message": {"message_id": 101},
+                                "text": " final",
+                            },
+                        }
+                    ]
+                return []
+            raise AssertionError(f"Unexpected method: {method}")
+
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        first_prompt = asyncio.create_task(client.ask_question("Prompt one", 5, "QTEST-ONE"))
+        second_prompt = asyncio.create_task(client.ask_question("Prompt two", 5, "QTEST-TWO"))
+
+        async def wait_until_both_prompts_are_registered():
+            while True:
+                async with client._lock:
+                    if len(client._unique_pending_prompts_locked()) == 2:
+                        return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_until_both_prompts_are_registered(), 1)
+        release_first_poll.set()
+        await second_poll_started.wait()
+        await asyncio.sleep(0.03)
+
+        assert first_prompt.done() is False
+        assert second_prompt.done() is False
+
+        release_second_poll.set()
+        assert await asyncio.gather(first_prompt, second_prompt) == [
+            "first-long final",
+            "second-long",
+        ]
+
+    asyncio.run(run_test())
 
 
 def test_telegram_client_confirms_consumed_updates_before_stopping(monkeypatch, tmp_path):

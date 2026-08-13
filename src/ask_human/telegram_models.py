@@ -82,6 +82,8 @@ class TelegramPendingPrompt:
     selected_quote_text: Optional[str] = None
     text_reply_ack_message_id: Optional[int] = None
     text_reply_finalize_task: Optional[asyncio.Task[None]] = None
+    text_reply_wait_after_poll_sequence: Optional[int] = None
+    text_reply_post_part_poll_processed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True)

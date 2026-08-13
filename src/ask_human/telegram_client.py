@@ -115,6 +115,7 @@ class TelegramPromptClient:
         self._pending_attachment_groups: dict[tuple[int, str], _PendingAttachmentGroup] = {}
         self._active_series_group: Optional[_PendingAttachmentGroup] = None
         self._poller_task: Optional[asyncio.Task[None]] = None
+        self._poll_sequence = 0
         self._background_status_tasks: set[asyncio.Task[None]] = set()
         self._latest_prompt_message_id: Optional[int] = None
 
@@ -336,6 +337,9 @@ class TelegramPromptClient:
                         self._poller_task = None
                         return
 
+                    self._poll_sequence += 1
+                    poll_sequence = self._poll_sequence
+
                 poll_timeout = (
                     0 if not has_pending_prompts else DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
                 )
@@ -346,6 +350,7 @@ class TelegramPromptClient:
                 )
                 self._debug_event(
                     "telegram_poll_start",
+                    poll_sequence=poll_sequence,
                     has_pending_prompts=has_pending_prompts,
                     offset=offset,
                     poll_timeout_seconds=poll_timeout,
@@ -402,6 +407,7 @@ class TelegramPromptClient:
 
                 self._debug_event(
                     "telegram_poll_ok",
+                    poll_sequence=poll_sequence,
                     has_pending_prompts=has_pending_prompts,
                     offset=offset,
                     update_count=len(updates),
@@ -416,6 +422,25 @@ class TelegramPromptClient:
 
                 for update in updates:
                     await self._handle_update(update)
+
+                async with self._lock:
+                    for pending_prompt in self._unique_pending_prompts_locked():
+                        wait_after = pending_prompt.text_reply_wait_after_poll_sequence
+                        post_part_poll_processed = (
+                            pending_prompt.text_reply_post_part_poll_processed
+                        )
+                        if (
+                            wait_after is not None
+                            and poll_sequence > wait_after
+                            and not post_part_poll_processed.is_set()
+                        ):
+                            self._debug_event(
+                                "telegram_text_reply_post_part_poll_processed",
+                                prompt_id=pending_prompt.prompt_id,
+                                poll_sequence=poll_sequence,
+                                wait_after_poll_sequence=wait_after,
+                            )
+                            post_part_poll_processed.set()
 
                 # Telegram only considers processed updates confirmed once we perform another
                 # getUpdates call with an offset higher than their update_id. When the last
@@ -631,6 +656,15 @@ class TelegramPromptClient:
                 current_pending.selected_quote_text = selected_quote_text
             current_pending.text_reply_ack_message_id = reply_to_message_id
             if should_wait_for_split_part:
+                current_pending.text_reply_wait_after_poll_sequence = self._poll_sequence
+                current_pending.text_reply_post_part_poll_processed.clear()
+                self._debug_event(
+                    "telegram_text_reply_split_wait",
+                    prompt_id=current_pending.prompt_id,
+                    prompt_message_id=prompt_message_id,
+                    part_count=len(current_pending.text_reply_parts),
+                    wait_after_poll_sequence=self._poll_sequence,
+                )
                 self._schedule_text_reply_finalize_locked(prompt_message_id, current_pending)
                 return
 
@@ -982,7 +1016,7 @@ class TelegramPromptClient:
         prompt_message_id: int,
         pending_prompt: TelegramPendingPrompt,
     ) -> None:
-        """Restart the short grace period for a likely split text reply."""
+        """Restart the minimum grace period for a likely split text reply."""
         if pending_prompt.text_reply_finalize_task is not None:
             pending_prompt.text_reply_finalize_task.cancel()
 
@@ -997,8 +1031,9 @@ class TelegramPromptClient:
         prompt_message_id: int,
         pending_prompt: TelegramPendingPrompt,
     ) -> None:
-        """Resolve a likely split text reply after waiting for follow-up parts."""
+        """Resolve after the grace period and a later poll page has been processed."""
         await asyncio.sleep(self.TEXT_REPLY_SPLIT_DEBOUNCE_SECONDS)
+        await pending_prompt.text_reply_post_part_poll_processed.wait()
         await self._resolve_pending_text_reply(prompt_message_id, pending_prompt)
 
     async def _resolve_pending_text_reply(
