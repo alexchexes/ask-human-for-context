@@ -18,4 +18,4 @@ def test_package_version():
     """Test that the package version is correct."""
     import ask_human
 
-    assert ask_human.__version__ == "0.3.8"
+    assert ask_human.__version__ == "0.3.9"
