@@ -35,6 +35,7 @@ name = "ask-human"
 version = "0.3.8"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "markdown-it-py" },
     { name = "mcp" },
     { name = "python-multipart" },
@@ -68,6 +69,7 @@ dev = [
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=26.5.1,<27" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.5.0,<2" },
+    { name = "httpx", specifier = ">=0.28.1,<0.29" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=8.0.1,<9" },
     { name = "markdown-it-py", specifier = ">=4.0.0,<5" },
     { name = "mcp", specifier = ">=1.23.0,<2" },

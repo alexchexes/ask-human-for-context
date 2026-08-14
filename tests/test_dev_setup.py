@@ -5,6 +5,7 @@ import re
 
 ROOT_DIR = os.path.join(os.path.dirname(__file__), "..")
 EXPECTED_RUNTIME_REQUIREMENTS = [
+    "httpx>=0.28.1,<0.29",
     "markdown-it-py>=4.0.0,<5",
     "mcp>=1.23.0,<2",
     "python-multipart>=0.0.27,<0.1",

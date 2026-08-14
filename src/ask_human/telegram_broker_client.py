@@ -2,13 +2,12 @@
 
 import asyncio
 import datetime as dt
-import json
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+
+import httpx
 
 from . import __version__
 from .broker_state import (
@@ -304,14 +303,22 @@ class TelegramBrokerClient:
             timeout_seconds=timeout,
         )
         try:
-            response = await asyncio.to_thread(
-                self._broker_request_sync,
-                listen_url,
-                path,
-                payload,
-                timeout,
-                method,
-            )
+            try:
+                request_url = f"{listen_url.rstrip('/')}/{path.lstrip('/')}"
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    http_response = await client.request(method, request_url, json=payload)
+                    http_response.raise_for_status()
+                response = http_response.json()
+            except httpx.HTTPStatusError as exc:
+                raise TelegramPromptError(
+                    f"Broker {path} request failed with HTTP {exc.response.status_code}: "
+                    f"{exc.response.text}"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise TelegramPromptError(f"Broker {path} request failed: {exc}") from exc
+
+            if not isinstance(response, dict):
+                raise TelegramPromptError(f"Broker {path} response was not a JSON object.")
         except TelegramPromptError as exc:
             self._debug_event(
                 "broker_client_request_error",
@@ -332,38 +339,3 @@ class TelegramBrokerClient:
             duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000),
         )
         return response
-
-    def _broker_request_sync(
-        self,
-        listen_url: str,
-        path: str,
-        payload: Optional[dict[str, Any]],
-        timeout: int,
-        method: str,
-    ) -> dict[str, Any]:
-        """Perform one blocking broker HTTP request."""
-        request_url = f"{listen_url.rstrip('/')}/{path.lstrip('/')}"
-        request_data = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"} if payload is not None else {}
-        request_obj = urllib.request.Request(
-            request_url,
-            data=request_data,
-            headers=headers,
-            method=method,
-        )
-
-        try:
-            with urllib.request.urlopen(request_obj, timeout=timeout) as response:
-                payload_json = json.load(response)
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise TelegramPromptError(
-                f"Broker {path} request failed with HTTP {exc.code}: {error_body}"
-            ) from exc
-        except OSError as exc:
-            raise TelegramPromptError(f"Broker {path} request failed: {exc}") from exc
-
-        if not isinstance(payload_json, dict):
-            raise TelegramPromptError(f"Broker {path} response was not a JSON object.")
-
-        return payload_json
