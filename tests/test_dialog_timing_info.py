@@ -32,8 +32,8 @@ def test_build_timing_info_block_contains_note(monkeypatch):
     block = prompt_formatting.build_timing_info_block(dt.datetime(2026, 5, 10, 9, 30, 0), 90)
 
     assert block == (
-        "Issued at: 10.05.2026 09:30:00"
-        " | Answer until: 10.05.2026 09:31:30"
+        "Issued at: 10.05.2026 09:30:00\n"
+        "Answer until: 10.05.2026 09:31:30"
         " (client may time out sooner)"
     )
 
@@ -48,7 +48,8 @@ def test_tool_keeps_default_prompt_shape_without_timing_info(monkeypatch):
 
     assert result == "✅ User reply:\nok"
     assert stub.timeout == server.DEFAULT_DIALOG_TIMEOUT_SECONDS
-    assert stub.question == "❓ Question:\nQuestion?"
+    section_rule = "─" * 16
+    assert stub.question == f"{section_rule} ❓ Question: {section_rule}\nQuestion?"
 
 
 def test_initialize_time_locale_uses_system_default(monkeypatch):
@@ -104,7 +105,7 @@ def test_tool_appends_timing_info_when_enabled(monkeypatch):
     monkeypatch.setattr(
         prompt_formatting,
         "build_timing_info_block",
-        lambda issued_at, timeout_seconds: "Issued at: 10.05.2026 09:30:00 | "
+        lambda issued_at, timeout_seconds: "Issued at: 10.05.2026 09:30:00\n"
         "Answer until: 10.05.2026 09:31:30 (client may time out sooner)",
     )
 
@@ -116,15 +117,15 @@ def test_tool_appends_timing_info_when_enabled(monkeypatch):
     )
 
     assert result == "✅ User reply:\nok"
-    separator = "─" * 40
+    separator = "─" * 39
+    section_rule = "─" * 16
     assert stub.question == (
-        "📋 Context:\n"
+        f"{section_rule}  📋 Context:  {section_rule}\n"
         "There are two valid implementation paths and the choice is user-facing.\n\n"
-        f"{separator}\n\n"
-        "❓ Question:\n"
+        f"{section_rule} ❓ Question: {section_rule}\n"
         "Should I keep the current API shape?\n\n"
-        f"{separator}\n\n"
-        "Issued at: 10.05.2026 09:30:00 | Answer until: 10.05.2026 09:31:30 "
+        f"{separator}\n"
+        "Issued at: 10.05.2026 09:30:00\nAnswer until: 10.05.2026 09:31:30 "
         "(client may time out sooner)"
     )
 
@@ -137,18 +138,19 @@ def test_tool_uses_consistent_question_label_without_context(monkeypatch):
     monkeypatch.setattr(
         prompt_formatting,
         "build_timing_info_block",
-        lambda issued_at, timeout_seconds: "Issued at: 10.05.2026 09:30:00 | "
+        lambda issued_at, timeout_seconds: "Issued at: 10.05.2026 09:30:00\n"
         "Answer until: 10.05.2026 09:31:30 (client may time out sooner)",
     )
 
     result = asyncio.run(server.ask_human("Question without context?"))
 
     assert result == "✅ User reply:\nok"
-    separator = "─" * 40
+    separator = "─" * 39
+    section_rule = "─" * 16
     assert stub.question == (
-        "❓ Question:\n"
+        f"{section_rule} ❓ Question: {section_rule}\n"
         "Question without context?\n\n"
-        f"{separator}\n\n"
-        "Issued at: 10.05.2026 09:30:00 | Answer until: 10.05.2026 09:31:30 "
+        f"{separator}\n"
+        "Issued at: 10.05.2026 09:30:00\nAnswer until: 10.05.2026 09:31:30 "
         "(client may time out sooner)"
     )

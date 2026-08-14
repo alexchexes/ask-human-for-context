@@ -614,7 +614,7 @@ args = [
 
 ### Local dialog development
 
-The `dialog` and `both` response channels use `osascript` on macOS and `tkinter` on Windows; these normally require no separate installation. Linux uses `zenity`, which requires a graphical desktop session and may need to be installed:
+The `dialog` and `both` response channels use AppKit through `osascript` on macOS and `tkinter` on Windows; these normally require no separate installation. Linux uses `zenity`, which requires a graphical desktop session and may need to be installed:
 
 ```bash
 sudo apt install zenity     # Debian/Ubuntu

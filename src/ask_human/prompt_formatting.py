@@ -304,7 +304,7 @@ def build_timing_info_lines(issued_at: dt.datetime, timeout_seconds: int) -> lis
 def build_timing_info_block(issued_at: dt.datetime, timeout_seconds: int) -> str:
     """Build the optional timing metadata shown in dialogs."""
     timing_lines = build_timing_info_lines(issued_at, timeout_seconds)
-    return f"{timing_lines[0]} | {timing_lines[1]} {timing_lines[2]}"
+    return f"{timing_lines[0]}\n{timing_lines[1]} {timing_lines[2]}"
 
 
 def build_dialog_telegram_notice(platform_name: str) -> str:
@@ -328,22 +328,26 @@ def build_prompt_text(
     issued_at: Optional[dt.datetime] = None,
 ) -> str:
     """Build the formatted prompt text for native dialogs."""
-    separator = "─" * 40
-    question_block = f"❓ Question:\n{question.strip()}"
-    if extra_note.strip():
-        question_block = f"{question_block}\n\n{extra_note.strip()}"
+    separator = "─" * 39
+    section_rule = "─" * 16
+    question_block = f"{section_rule} ❓ Question: {section_rule}\n{question.strip()}"
 
     if context.strip():
-        full_question = f"📋 Context:\n{context.strip()}\n\n{separator}\n\n{question_block}"
+        context_block = f"{section_rule}  📋 Context:  {section_rule}\n{context.strip()}"
+        full_question = f"{context_block}\n\n{question_block}"
     else:
         full_question = question_block
 
+    footer_parts = []
+    if extra_note.strip():
+        footer_parts.append(extra_note.strip())
+
     if include_timing_info:
         effective_issued_at = issued_at or dt.datetime.now().astimezone()
-        return (
-            f"{full_question}\n\n{separator}\n\n"
-            f"{build_timing_info_block(effective_issued_at, timeout_seconds)}"
-        )
+        footer_parts.append(build_timing_info_block(effective_issued_at, timeout_seconds))
+
+    if footer_parts:
+        return f"{full_question}\n\n{separator}\n" + "\n".join(footer_parts)
 
     return full_question
 

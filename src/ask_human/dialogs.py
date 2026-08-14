@@ -1,6 +1,7 @@
 """Cross-platform GUI dialog handling for Ask Human prompts."""
 
 import asyncio
+import json
 import platform
 import re
 from contextlib import suppress
@@ -11,6 +12,7 @@ from .prompt_formatting import resolve_dialog_title
 
 DEFAULT_DIALOG_TIMEOUT_SECONDS = 3600
 PACKAGE_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+MACOS_DIALOG_SCRIPT = PACKAGE_ASSETS_DIR / "macos-dialog.js"
 WINDOWS_DIALOG_SCREEN_WIDTH_RATIO = 0.85
 WINDOWS_DIALOG_MIN_WRAP_WIDTH_PX = 600
 WINDOWS_DIALOG_MAX_WRAP_WIDTH_PX = 1400
@@ -32,7 +34,8 @@ class UserPromptError(Exception):
 class GUIDialogHandler:
     """Cross-platform GUI dialog handler for asking humans for input.
 
-    Provides native GUI dialogs on macOS (osascript), Linux (zenity), and Windows (tkinter).
+    Provides native GUI dialogs on macOS (AppKit through osascript), Linux (zenity), and
+    Windows (tkinter).
     Falls back to terminal input if GUI is unavailable.
     """
 
@@ -153,29 +156,19 @@ class GUIDialogHandler:
     async def _macos_dialog(
         self, question: str, timeout: int, *, cancel_event: Optional[asyncio.Event] = None
     ) -> Optional[str]:
-        """macOS dialog using osascript."""
+        """Show the packaged AppKit dialog through JavaScript for Automation."""
         icon_path = PACKAGE_ASSETS_DIR / "agent-asks.icns"
-
-        if icon_path.exists():
-            icon_clause = f'with icon file (POSIX file "{icon_path}")'
-        else:
-            icon_clause = "with icon caution"
-
-        script = f"""
-        set dialog_result to display dialog "{self._escape_for_applescript(question)}" ¬
-        default answer "" ¬
-        with title "{self._escape_for_applescript(self.dialog_title)}" ¬
-        {icon_clause} ¬
-        giving up after {timeout}
-        if gave up of dialog_result then error number -128
-        return text returned of dialog_result
-        """
 
         try:
             process = await asyncio.create_subprocess_exec(
                 "osascript",
-                "-e",
-                script,
+                "-l",
+                "JavaScript",
+                str(MACOS_DIALOG_SCRIPT),
+                self.dialog_title,
+                question,
+                str(icon_path),
+                str(timeout),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -187,7 +180,9 @@ class GUIDialogHandler:
                 return None
 
             if process.returncode == 0:
-                return stdout.decode().strip()
+                result = json.loads(stdout.decode())
+                if result.get("status") == "ok" and isinstance(result.get("value"), str):
+                    return cast(str, result["value"])
             return None
         except Exception:
             return None
@@ -294,10 +289,6 @@ class GUIDialogHandler:
                 root.after_cancel(timeout_id)
             except Exception:
                 pass
-
-    def _escape_for_applescript(self, text: str) -> str:
-        """Escape text for AppleScript."""
-        return text.replace('"', '\\"').replace("\\", "\\\\")
 
     def _get_linux_icon_args(self) -> list[str]:
         """Get icon arguments for Linux zenity dialog."""
