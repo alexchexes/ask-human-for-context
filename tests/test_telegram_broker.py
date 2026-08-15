@@ -87,6 +87,7 @@ def test_build_broker_health_payload_contains_identity_and_url(tmp_path):
     assert payload["listen_url"] == "http://127.0.0.1:7456"
     assert payload["target_key"] == "feedbeef"
     assert "version" in payload
+    assert payload["supports_guarded_shutdown"] is True
 
 
 def test_broker_prompt_cancels_when_client_disconnects(monkeypatch, tmp_path):
@@ -162,7 +163,8 @@ def test_broker_shutdown_cancels_pending_prompt(monkeypatch, tmp_path):
             return False
 
     class FakeShutdownRequest:
-        pass
+        async def json(self):
+            return {"force": True}
 
     class FakeTelegramClient:
         def __init__(self):
@@ -211,11 +213,155 @@ def test_broker_shutdown_cancels_pending_prompt(monkeypatch, tmp_path):
 
     assert shutdown_response.status_code == 200
     assert b'"status":"ok"' in shutdown_response.body
+    assert b'"cancelled_prompt_count":1' in shutdown_response.body
     assert prompt_response.status_code == 499
     assert b"Broker shutdown requested" in prompt_response.body
     assert telegram_client.cancelled is True
     assert telegram_client.shutdown_called is True
     assert shutdown_calls == ["shutdown"]
+
+
+def test_broker_graceful_shutdown_refuses_active_prompt(tmp_path):
+    """Keep active prompts running when a graceful shutdown is requested."""
+
+    class FakePromptRequest:
+        async def json(self):
+            return {
+                "prompt_texts": ["Prompt text"],
+                "prompt_id": "QTEST-1234",
+                "timeout_seconds": 300,
+                "download_dir": str(tmp_path),
+            }
+
+        async def is_disconnected(self):
+            return False
+
+    class FakeShutdownRequest:
+        async def json(self):
+            return {}
+
+    class FakeTelegramClient:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = False
+            self.shutdown_called = False
+
+        async def ask_question(self, prompt_texts, timeout_seconds, prompt_id, download_dir):
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return "telegram answer"
+
+        async def shutdown(self):
+            self.shutdown_called = True
+
+    shutdown_calls = []
+    telegram_client = FakeTelegramClient()
+    app = create_telegram_broker_app(
+        TelegramBrokerIdentity("abcd1234", "office"),
+        listen_url="http://127.0.0.1:7456",
+        telegram_client=cast(Any, telegram_client),
+        target_key="feedbeef",
+        shutdown_event=asyncio.Event(),
+        request_shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+    prompts_route = cast(
+        Any,
+        next(route for route in app.routes if getattr(route, "path", None) == "/prompts"),
+    )
+    shutdown_route = cast(
+        Any,
+        next(route for route in app.routes if getattr(route, "path", None) == "/shutdown"),
+    )
+
+    async def run_shutdown_flow():
+        prompt_task = asyncio.create_task(prompts_route.endpoint(FakePromptRequest()))
+        await telegram_client.started.wait()
+        shutdown_response = await shutdown_route.endpoint(FakeShutdownRequest())
+        assert prompt_task.done() is False
+        telegram_client.release.set()
+        prompt_response = await prompt_task
+        return shutdown_response, prompt_response
+
+    shutdown_response, prompt_response = asyncio.run(run_shutdown_flow())
+
+    assert shutdown_response.status_code == 409
+    assert b'"status":"busy"' in shutdown_response.body
+    assert b'"pending_prompt_count":1' in shutdown_response.body
+    assert prompt_response.status_code == 200
+    assert b'"response":"telegram answer"' in prompt_response.body
+    assert telegram_client.cancelled is False
+    assert telegram_client.shutdown_called is False
+    assert shutdown_calls == []
+
+
+def test_broker_rejects_new_prompt_after_shutdown_starts(tmp_path):
+    """Do not admit prompt requests after an idle shutdown has been accepted."""
+
+    class FakePromptRequest:
+        async def json(self):
+            return {
+                "prompt_texts": ["Prompt text"],
+                "prompt_id": "QTEST-1234",
+                "timeout_seconds": 300,
+                "download_dir": str(tmp_path),
+            }
+
+        async def is_disconnected(self):
+            return False
+
+    class FakeShutdownRequest:
+        async def json(self):
+            return {}
+
+    class FakeTelegramClient:
+        def __init__(self):
+            self.shutdown_started = asyncio.Event()
+            self.finish_shutdown = asyncio.Event()
+            self.prompt_calls = 0
+
+        async def ask_question(self, prompt_texts, timeout_seconds, prompt_id, download_dir):
+            self.prompt_calls += 1
+            return "unexpected answer"
+
+        async def shutdown(self):
+            self.shutdown_started.set()
+            await self.finish_shutdown.wait()
+
+    telegram_client = FakeTelegramClient()
+    app = create_telegram_broker_app(
+        TelegramBrokerIdentity("abcd1234", "office"),
+        listen_url="http://127.0.0.1:7456",
+        telegram_client=cast(Any, telegram_client),
+        target_key="feedbeef",
+    )
+    prompts_route = cast(
+        Any,
+        next(route for route in app.routes if getattr(route, "path", None) == "/prompts"),
+    )
+    shutdown_route = cast(
+        Any,
+        next(route for route in app.routes if getattr(route, "path", None) == "/shutdown"),
+    )
+
+    async def run_shutdown_flow():
+        shutdown_task = asyncio.create_task(shutdown_route.endpoint(FakeShutdownRequest()))
+        await telegram_client.shutdown_started.wait()
+        prompt_response = await prompts_route.endpoint(FakePromptRequest())
+        telegram_client.finish_shutdown.set()
+        shutdown_response = await shutdown_task
+        return shutdown_response, prompt_response
+
+    shutdown_response, prompt_response = asyncio.run(run_shutdown_flow())
+
+    assert shutdown_response.status_code == 200
+    assert prompt_response.status_code == 503
+    assert b'"status":"unavailable"' in prompt_response.body
+    assert telegram_client.prompt_calls == 0
 
 
 def test_broker_shutdown_status_wins_over_prompt_error(tmp_path):

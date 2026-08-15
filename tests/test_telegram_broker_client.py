@@ -179,6 +179,48 @@ def test_broker_client_waits_for_started_broker(monkeypatch, tmp_path):
     assert calls["replace_mismatched"] == [False, True]
 
 
+def test_broker_client_explains_spawned_version_skew(monkeypatch, tmp_path):
+    """Explain editable-install parent/child skew instead of reporting vague health failure."""
+    telegram_target = TelegramConfig("123456:ABCDEF", "-1009876543210")
+    client = TelegramBrokerClient(
+        telegram_target,
+        tmp_path / "downloads",
+        broker_state_root=tmp_path / "state",
+    )
+    identity = load_or_create_broker_identity(client.target_state_dir, broker_label="new")
+    persist_broker_listen_url(client.target_state_dir, "http://127.0.0.1:7456")
+    loop_times = iter([0.0, 0.0, 16.0])
+
+    class FakeLoop:
+        def time(self):
+            return next(loop_times)
+
+    async def fake_fetch_health(listen_url):
+        return TelegramBrokerHealth(
+            broker_id=identity.broker_id,
+            broker_label=identity.broker_label,
+            listen_url=listen_url,
+            target_key=resolve_telegram_target_key(telegram_target),
+            version="99.0.0",
+            supports_guarded_shutdown=True,
+        )
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(broker_client_module.asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(broker_client_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
+
+    with pytest.raises(TelegramPromptError) as exc_info:
+        asyncio.run(client._wait_for_local_broker())
+
+    error = str(exc_info.value)
+    assert "observed broker v99.0.0" in error
+    assert f"v{__version__} loaded" in error
+    assert "reload/restart this session's Ask Human MCP server" in error
+
+
 def test_broker_client_passes_debug_log_to_spawned_broker(monkeypatch, tmp_path):
     """Forward Telegram debug logging to an auto-started broker process."""
     client = TelegramBrokerClient(
@@ -205,8 +247,8 @@ def test_broker_client_passes_debug_log_to_spawned_broker(monkeypatch, tmp_path)
     )
 
 
-def test_broker_client_shuts_down_version_mismatched_broker(monkeypatch, tmp_path):
-    """Replace a broker from another package version before sending prompts."""
+def test_broker_client_replaces_idle_older_guarded_broker(monkeypatch, tmp_path):
+    """Replace an older broker only after its guarded shutdown succeeds."""
     telegram_target = TelegramConfig("123456:ABCDEF", "-1009876543210")
     client = TelegramBrokerClient(
         telegram_target,
@@ -224,11 +266,12 @@ def test_broker_client_shuts_down_version_mismatched_broker(monkeypatch, tmp_pat
             listen_url=listen_url,
             target_key=resolve_telegram_target_key(telegram_target),
             version="0.0.0",
+            supports_guarded_shutdown=True,
         )
 
     async def fake_shutdown_broker(listen_url):
         shutdown_calls.append(listen_url)
-        return True
+        return broker_client_module._BrokerShutdownResult("stopped")
 
     monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
     monkeypatch.setattr(client, "_shutdown_broker", fake_shutdown_broker)
@@ -273,7 +316,7 @@ def test_broker_client_read_only_probe_does_not_shutdown_mismatched_broker(
     assert result is None
 
 
-def test_broker_client_refuses_when_mismatched_broker_cannot_shutdown(
+def test_broker_client_refuses_when_older_guarded_broker_cannot_shutdown(
     monkeypatch,
     tmp_path,
 ):
@@ -294,16 +337,161 @@ def test_broker_client_refuses_when_mismatched_broker_cannot_shutdown(
             listen_url=listen_url,
             target_key=resolve_telegram_target_key(telegram_target),
             version="0.0.0",
+            supports_guarded_shutdown=True,
         )
 
     async def fake_shutdown_broker(listen_url):
-        return False
+        return broker_client_module._BrokerShutdownResult("failed")
 
     monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
     monkeypatch.setattr(client, "_shutdown_broker", fake_shutdown_broker)
 
-    with pytest.raises(TelegramPromptError, match="Tell the user to stop"):
+    with pytest.raises(TelegramPromptError, match="safe shutdown .* could not be confirmed"):
         asyncio.run(client._probe_persisted_broker(replace_mismatched=True))
+
+
+def test_broker_client_preserves_busy_older_guarded_broker(monkeypatch, tmp_path):
+    """Report the active count without replacing or cancelling a busy broker."""
+    telegram_target = TelegramConfig("123456:ABCDEF", "-1009876543210")
+    client = TelegramBrokerClient(
+        telegram_target,
+        tmp_path / "downloads",
+        broker_state_root=tmp_path / "state",
+    )
+    identity = load_or_create_broker_identity(client.target_state_dir, broker_label="old")
+    persist_broker_listen_url(client.target_state_dir, "http://127.0.0.1:7456")
+
+    async def fake_fetch_health(listen_url):
+        return TelegramBrokerHealth(
+            broker_id=identity.broker_id,
+            broker_label=identity.broker_label,
+            listen_url=listen_url,
+            target_key=resolve_telegram_target_key(telegram_target),
+            version="0.0.0",
+            supports_guarded_shutdown=True,
+        )
+
+    async def fake_shutdown_broker(listen_url):
+        return broker_client_module._BrokerShutdownResult("busy", 2)
+
+    monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
+    monkeypatch.setattr(client, "_shutdown_broker", fake_shutdown_broker)
+
+    with pytest.raises(TelegramPromptError) as exc_info:
+        asyncio.run(client._probe_persisted_broker(replace_mismatched=True))
+
+    error = str(exc_info.value)
+    assert "has 2 pending prompts" in error
+    assert "Nothing was cancelled" in error
+    assert "Ask the user to finish" in error
+    assert "update automatically" in error
+
+
+def test_broker_client_leaves_legacy_older_broker_untouched(monkeypatch, tmp_path):
+    """Do not assume an older broker can guard active prompts during replacement."""
+    telegram_target = TelegramConfig("123456:ABCDEF", "-1009876543210")
+    client = TelegramBrokerClient(
+        telegram_target,
+        tmp_path / "downloads",
+        broker_state_root=tmp_path / "state",
+    )
+    identity = load_or_create_broker_identity(client.target_state_dir, broker_label="legacy")
+    persist_broker_listen_url(client.target_state_dir, "http://127.0.0.1:7456")
+
+    async def fake_fetch_health(listen_url):
+        return TelegramBrokerHealth(
+            broker_id=identity.broker_id,
+            broker_label=identity.broker_label,
+            listen_url=listen_url,
+            target_key=resolve_telegram_target_key(telegram_target),
+            version="0.0.0",
+            supports_guarded_shutdown=False,
+        )
+
+    async def fail_shutdown(_listen_url):
+        raise AssertionError("Legacy broker should be left untouched")
+
+    monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
+    monkeypatch.setattr(client, "_shutdown_broker", fail_shutdown)
+
+    with pytest.raises(TelegramPromptError) as exc_info:
+        asyncio.run(client._probe_persisted_broker(replace_mismatched=True))
+
+    error = str(exc_info.value)
+    assert "legacy v0.0.0" in error
+    assert "left running" in error
+    assert "Ask the user" in error
+
+
+def test_broker_client_never_downgrades_newer_broker(monkeypatch, tmp_path):
+    """Tell the agent to restart a stale MCP session instead of downgrading."""
+    telegram_target = TelegramConfig("123456:ABCDEF", "-1009876543210")
+    client = TelegramBrokerClient(
+        telegram_target,
+        tmp_path / "downloads",
+        broker_state_root=tmp_path / "state",
+    )
+    identity = load_or_create_broker_identity(client.target_state_dir, broker_label="new")
+    persist_broker_listen_url(client.target_state_dir, "http://127.0.0.1:7456")
+
+    async def fake_fetch_health(listen_url):
+        return TelegramBrokerHealth(
+            broker_id=identity.broker_id,
+            broker_label=identity.broker_label,
+            listen_url=listen_url,
+            target_key=resolve_telegram_target_key(telegram_target),
+            version="99.0.0",
+            supports_guarded_shutdown=True,
+        )
+
+    async def fail_shutdown(_listen_url):
+        raise AssertionError("A stale client should never downgrade a newer broker")
+
+    monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
+    monkeypatch.setattr(client, "_shutdown_broker", fail_shutdown)
+
+    with pytest.raises(TelegramPromptError) as exc_info:
+        asyncio.run(client._probe_persisted_broker(replace_mismatched=True))
+
+    error = str(exc_info.value)
+    assert "shared Telegram broker is newer v99.0.0" in error
+    assert "left untouched" in error
+    assert "reload/restart this session's Ask Human MCP server" in error
+
+
+def test_broker_client_leaves_unrecognized_version_untouched(monkeypatch, tmp_path):
+    """Fail conservatively when package-version ordering cannot be established."""
+    telegram_target = TelegramConfig("123456:ABCDEF", "-1009876543210")
+    client = TelegramBrokerClient(
+        telegram_target,
+        tmp_path / "downloads",
+        broker_state_root=tmp_path / "state",
+    )
+    identity = load_or_create_broker_identity(client.target_state_dir, broker_label="unknown")
+    persist_broker_listen_url(client.target_state_dir, "http://127.0.0.1:7456")
+
+    async def fake_fetch_health(listen_url):
+        return TelegramBrokerHealth(
+            broker_id=identity.broker_id,
+            broker_label=identity.broker_label,
+            listen_url=listen_url,
+            target_key=resolve_telegram_target_key(telegram_target),
+            version="development-build",
+            supports_guarded_shutdown=True,
+        )
+
+    async def fail_shutdown(_listen_url):
+        raise AssertionError("An unrecognized broker version should be left untouched")
+
+    monkeypatch.setattr(client, "_fetch_health", fake_fetch_health)
+    monkeypatch.setattr(client, "_shutdown_broker", fail_shutdown)
+
+    with pytest.raises(TelegramPromptError) as exc_info:
+        asyncio.run(client._probe_persisted_broker(replace_mismatched=True))
+
+    error = str(exc_info.value)
+    assert "reports vdevelopment-build" in error
+    assert "left untouched" in error
 
 
 def test_broker_client_reuses_same_version_broker(monkeypatch, tmp_path):

@@ -44,6 +44,7 @@ class TelegramBrokerHealth:
     listen_url: str
     target_key: str
     version: str = ""
+    supports_guarded_shutdown: bool = False
 
 
 def resolve_broker_state_dir(state_dir: Optional[str] = None) -> Path:

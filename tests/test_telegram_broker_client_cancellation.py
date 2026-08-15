@@ -28,6 +28,7 @@ class ControllableTelegramClient:
         self.release: dict[str, asyncio.Event] = {}
         self.any_started = asyncio.Event()
         self.any_cancelled = asyncio.Event()
+        self.shutdown_called = asyncio.Event()
 
     def _event(self, events: dict[str, asyncio.Event], prompt_id: str) -> asyncio.Event:
         return events.setdefault(prompt_id, asyncio.Event())
@@ -48,6 +49,9 @@ class ControllableTelegramClient:
             self.any_cancelled.set()
             raise
         return f"reply for {prompt_id}"
+
+    async def shutdown(self) -> None:
+        self.shutdown_called.set()
 
 
 @asynccontextmanager
@@ -157,6 +161,7 @@ def test_broker_client_fetches_health_over_async_transport(tmp_path: Path) -> No
             listen_url=listen_url,
             target_key="feedbeef",
             version=__version__,
+            supports_guarded_shutdown=True,
         )
 
     asyncio.run(scenario())
@@ -215,6 +220,61 @@ def test_cancelling_one_broker_request_keeps_another_prompt_active(
                 "status": "ok",
                 "response": "reply for QSECOND",
             }
+
+    asyncio.run(scenario())
+
+
+def test_graceful_shutdown_preserves_real_broker_prompts(tmp_path: Path) -> None:
+    """Carry the guarded HTTP 409 and active count through the real transport."""
+
+    async def scenario() -> None:
+        telegram_client = ControllableTelegramClient()
+        client = make_client(tmp_path)
+
+        async with running_broker(telegram_client) as listen_url:
+            first_task = asyncio.create_task(
+                client._broker_request(
+                    listen_url,
+                    "prompts",
+                    prompt_payload("QFIRST", tmp_path),
+                    timeout=30,
+                )
+            )
+            second_task = asyncio.create_task(
+                client._broker_request(
+                    listen_url,
+                    "prompts",
+                    prompt_payload("QSECOND", tmp_path),
+                    timeout=30,
+                )
+            )
+            await asyncio.gather(
+                asyncio.wait_for(
+                    telegram_client._event(telegram_client.started, "QFIRST").wait(),
+                    timeout=2,
+                ),
+                asyncio.wait_for(
+                    telegram_client._event(telegram_client.started, "QSECOND").wait(),
+                    timeout=2,
+                ),
+            )
+
+            busy_result = await client._shutdown_broker(listen_url)
+            assert busy_result.status == "busy"
+            assert busy_result.pending_prompt_count == 2
+            assert telegram_client.any_cancelled.is_set() is False
+            assert telegram_client.shutdown_called.is_set() is False
+
+            telegram_client._event(telegram_client.release, "QFIRST").set()
+            telegram_client._event(telegram_client.release, "QSECOND").set()
+            assert await asyncio.gather(first_task, second_task) == [
+                {"status": "ok", "response": "reply for QFIRST"},
+                {"status": "ok", "response": "reply for QSECOND"},
+            ]
+
+            stopped_result = await client._shutdown_broker(listen_url)
+            assert stopped_result.status == "stopped"
+            assert telegram_client.shutdown_called.is_set() is True
 
     asyncio.run(scenario())
 

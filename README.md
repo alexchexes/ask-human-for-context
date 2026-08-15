@@ -392,6 +392,14 @@ Current behavior:
 
 This makes same-machine concurrent Telegram prompts safe.
 
+Package updates are handled conservatively:
+
+- sessions already running the current package version keep reusing the broker normally
+- a newer session updates an older broker automatically only when that broker supports guarded shutdown and has no active prompts
+- if the broker still has active prompts, the new question is not sent and nothing is cancelled; the tool tells the agent to ask the user to finish those prompts and retry
+- a session older than the broker never downgrades it; the tool tells the agent to ask the user to reload or restart that session, then retry
+- a legacy broker that cannot prove replacement is safe is left untouched and requires the one-time manual restart below
+
 Current limitation:
 
 - cross-machine or shared-server coordination is not implemented yet
@@ -410,7 +418,9 @@ Advanced/manual broker mode is mainly for debugging and future remote deployment
 ask-human --telegram-broker --telegram "<bot_token> <chat_id>"
 ```
 
-Stop a local broker on Windows for testing or troubleshooting:
+To replace a legacy broker after an ask-human update, first finish every pending Ask Human prompt. Then find and stop only the confirmed broker process. Pending prompts cannot be recovered if their broker is stopped.
+
+Windows (PowerShell):
 
 ```powershell
 Get-CimInstance Win32_Process |
@@ -419,10 +429,19 @@ Get-CimInstance Win32_Process |
     $_.CommandLine -like '*ask_human*' -and
     $_.CommandLine -like '*--telegram-broker*'
   } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+  Select-Object ProcessId, CommandLine
+
+Stop-Process -Id 12345  # replace with the confirmed broker PID
 ```
 
-The next Telegram prompt auto-starts a fresh local broker if one is needed.
+macOS or Linux:
+
+```bash
+pgrep -fl -- '--telegram-broker'
+kill 12345  # replace with the confirmed broker PID
+```
+
+Reload or restart any session that still has the previous ask-human version loaded. The next Telegram prompt then auto-starts a fresh local broker if one is needed.
 
 In `both` mode:
 
@@ -452,15 +471,17 @@ Telegram reply behavior:
 Replies created with Telegram's Premium Rich Text Editor are not supported yet. The bot asks you to
 retry with regular text or a supported attachment.
 
-Optional command menu: in `@BotFather`, run `/setcommands`, pick your bot, and send:
+</details>
+
+#### Bot commands
+
+Optionally, add Telegram bot command menu: in `@BotFather`, run `/setcommands`, pick your bot, and send:
 
 ```text
-files_start - Start collecting many attachments
-files_finish - Send the collected attachments
-files_cancel - Cancel the current attachment collection
+files_start - Start collecting files/messages
+files_finish - Send the collected files/messages
+files_cancel - Cancel collecting files/messages
 ```
-
-</details>
 
 ### Command args reference
 
@@ -624,7 +645,7 @@ sudo pacman -S zenity       # Arch
 
 These platform tools are not needed for Telegram-only development, checks, or builds.
 
-When changing Telegram broker/client code during local development, stop any running local Telegram broker before retesting. Otherwise the detached broker may keep running old code from before your edit. See [How Telegram broker works](#how-telegram-broker-works) for the Windows stop command.
+When changing Telegram broker/client code during local development, stop any running local Telegram broker before retesting. Otherwise the detached broker may keep running old code from before your edit. See [How Telegram broker works](#how-telegram-broker-works) for the guarded update behavior and manual stop commands.
 
 Run checks:
 

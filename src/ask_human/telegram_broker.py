@@ -50,7 +50,7 @@ def build_broker_health_payload(
     *,
     listen_url: str,
     target_key: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Build the broker health response."""
     return {
         "status": "ok",
@@ -59,6 +59,7 @@ def build_broker_health_payload(
         "listen_url": listen_url,
         "target_key": target_key,
         "version": __version__,
+        "supports_guarded_shutdown": True,
     }
 
 
@@ -107,6 +108,9 @@ def create_telegram_broker_app(
 ) -> Starlette:
     """Create the broker HTTP app."""
 
+    active_prompt_count = 0
+    shutdown_started = False
+
     def debug_event(event: str, **fields: Any) -> None:
         if debug_logger is not None:
             debug_logger.event(event, **fields)
@@ -121,6 +125,7 @@ def create_telegram_broker_app(
         )
 
     async def prompts(request: Request) -> JSONResponse:
+        nonlocal active_prompt_count
         request_started_at = asyncio.get_running_loop().time()
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -160,63 +165,110 @@ def create_telegram_broker_app(
 
         download_dir = resolve_telegram_download_dir(download_dir_raw)
         download_dir.mkdir(parents=True, exist_ok=True)
-        debug_event(
-            "broker_prompt_request_start",
-            prompt_id=prompt_id,
-            prompt_message_count=len(prompt_texts),
-            timeout_seconds=timeout_seconds,
-        )
 
-        prompt_task = asyncio.create_task(
-            telegram_client.ask_question(
-                prompt_texts,
-                timeout_seconds,
-                prompt_id,
-                download_dir,
-            )
-        )
-        try:
-            response = await _wait_for_prompt_or_client_disconnect(
-                request,
-                prompt_task,
-                shutdown_event,
-            )
-        except BrokerPromptClientDisconnected as exc:
-            debug_event(
-                "broker_prompt_request_cancelled",
-                prompt_id=prompt_id,
-                duration_ms=round((asyncio.get_running_loop().time() - request_started_at) * 1000),
-                error=exc,
-            )
+        # These checks and the counter increment contain no await. Starlette runs them
+        # on the broker's asyncio event loop, so graceful shutdown cannot pass its own
+        # check between accepting this request and recording it as active.
+        if shutdown_started:
             return JSONResponse(
-                {"status": "cancelled", "error": str(exc)},
-                status_code=499,
+                {
+                    "status": "unavailable",
+                    "error": "Broker shutdown is already in progress.",
+                },
+                status_code=503,
             )
-        except TelegramPromptError as exc:
+        active_prompt_count += 1
+        try:
             debug_event(
-                "broker_prompt_request_error",
+                "broker_prompt_request_start",
+                prompt_id=prompt_id,
+                prompt_message_count=len(prompt_texts),
+                timeout_seconds=timeout_seconds,
+            )
+            prompt_task = asyncio.create_task(
+                telegram_client.ask_question(
+                    prompt_texts,
+                    timeout_seconds,
+                    prompt_id,
+                    download_dir,
+                )
+            )
+            try:
+                response = await _wait_for_prompt_or_client_disconnect(
+                    request,
+                    prompt_task,
+                    shutdown_event,
+                )
+            except BrokerPromptClientDisconnected as exc:
+                debug_event(
+                    "broker_prompt_request_cancelled",
+                    prompt_id=prompt_id,
+                    duration_ms=round(
+                        (asyncio.get_running_loop().time() - request_started_at) * 1000
+                    ),
+                    error=exc,
+                )
+                return JSONResponse(
+                    {"status": "cancelled", "error": str(exc)},
+                    status_code=499,
+                )
+            except TelegramPromptError as exc:
+                debug_event(
+                    "broker_prompt_request_error",
+                    prompt_id=prompt_id,
+                    duration_ms=round(
+                        (asyncio.get_running_loop().time() - request_started_at) * 1000
+                    ),
+                    error=exc,
+                )
+                return JSONResponse({"status": "error", "error": str(exc)}, status_code=500)
+
+            if response is None:
+                debug_event(
+                    "broker_prompt_request_timeout",
+                    prompt_id=prompt_id,
+                    duration_ms=round(
+                        (asyncio.get_running_loop().time() - request_started_at) * 1000
+                    ),
+                )
+                return JSONResponse({"status": "timeout"})
+
+            debug_event(
+                "broker_prompt_request_ok",
                 prompt_id=prompt_id,
                 duration_ms=round((asyncio.get_running_loop().time() - request_started_at) * 1000),
-                error=exc,
             )
-            return JSONResponse({"status": "error", "error": str(exc)}, status_code=500)
+            return JSONResponse({"status": "ok", "response": response})
+        finally:
+            active_prompt_count -= 1
 
-        if response is None:
-            debug_event(
-                "broker_prompt_request_timeout",
-                prompt_id=prompt_id,
-                duration_ms=round((asyncio.get_running_loop().time() - request_started_at) * 1000),
+    async def shutdown(request: Request) -> JSONResponse:
+        nonlocal shutdown_started
+
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"status": "error", "error": "Request body must be a JSON object."},
+                status_code=400,
             )
-            return JSONResponse({"status": "timeout"})
+        force = payload.get("force") is True
 
-        debug_event(
-            "broker_prompt_request_ok",
-            prompt_id=prompt_id,
-            duration_ms=round((asyncio.get_running_loop().time() - request_started_at) * 1000),
-        )
-        return JSONResponse({"status": "ok", "response": response})
+        # As with prompt admission above, do not await between checking active work and
+        # entering shutdown. New prompt requests observe shutdown_started and are refused.
+        if shutdown_started:
+            return JSONResponse({"status": "ok"})
+        pending_prompt_count = active_prompt_count
+        if pending_prompt_count > 0 and not force:
+            return JSONResponse(
+                {
+                    "status": "busy",
+                    "pending_prompt_count": pending_prompt_count,
+                    "error": "Broker has active prompt requests and was left running.",
+                },
+                status_code=409,
+            )
+        shutdown_started = True
 
-    async def shutdown(_request: Request) -> JSONResponse:
         if shutdown_event is not None:
             shutdown_event.set()
             await asyncio.sleep(BROKER_DISCONNECT_POLL_SECONDS)
@@ -228,7 +280,12 @@ def create_telegram_broker_app(
         if request_shutdown is not None:
             asyncio.create_task(_request_shutdown_soon(request_shutdown))
 
-        return JSONResponse({"status": "ok"})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "cancelled_prompt_count": pending_prompt_count if force else 0,
+            }
+        )
 
     return Starlette(
         debug=False,
