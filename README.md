@@ -645,6 +645,8 @@ sudo pacman -S zenity       # Arch
 
 These platform tools are not needed for Telegram-only development, checks, or builds.
 
+> Native macOS dialog behavior is tested locally on macOS 26.6 and exercised in CI by GitHub's `macos-latest` runner. Older macOS releases were not tested yet.
+
 When changing Telegram broker/client code during local development, stop any running local Telegram broker before retesting. Otherwise the detached broker may keep running old code from before your edit. See [How Telegram broker works](#how-telegram-broker-works) for the guarded update behavior and manual stop commands.
 
 Run checks:

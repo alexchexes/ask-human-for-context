@@ -8,6 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
+from .macos_prompt import build_plain_macos_prompt_document
 from .prompt_formatting import resolve_dialog_title
 
 DEFAULT_DIALOG_TIMEOUT_SECONDS = 3600
@@ -51,11 +52,17 @@ class GUIDialogHandler:
         *,
         cancel_event: Optional[asyncio.Event] = None,
         run_in_thread: bool = False,
+        macos_prompt_document: Optional[dict[str, Any]] = None,
     ) -> Optional[str]:
         """Get user input via native GUI dialog with timeout."""
         try:
             if self.platform == "Darwin":
-                return await self._macos_dialog(question, timeout, cancel_event=cancel_event)
+                return await self._macos_dialog(
+                    question,
+                    timeout,
+                    cancel_event=cancel_event,
+                    prompt_document=macos_prompt_document,
+                )
             if self.platform == "Linux":
                 return await self._linux_dialog(question, timeout, cancel_event=cancel_event)
             return await self._windows_dialog(
@@ -75,9 +82,12 @@ class GUIDialogHandler:
         self,
         process: asyncio.subprocess.Process,
         cancel_event: Optional[asyncio.Event],
+        stdin_data: Optional[bytes] = None,
     ) -> tuple[bytes, bytes, bool]:
         """Wait for a dialog subprocess or cancel it if another channel wins."""
-        communicate_task = asyncio.create_task(process.communicate())
+        communicate_task = asyncio.create_task(
+            process.communicate(stdin_data) if stdin_data is not None else process.communicate()
+        )
         cancel_task: Optional[asyncio.Task[bool]] = None
         if cancel_event is not None:
             cancel_task = asyncio.create_task(cancel_event.wait())
@@ -154,10 +164,17 @@ class GUIDialogHandler:
             pass
 
     async def _macos_dialog(
-        self, question: str, timeout: int, *, cancel_event: Optional[asyncio.Event] = None
+        self,
+        question: str,
+        timeout: int,
+        *,
+        cancel_event: Optional[asyncio.Event] = None,
+        prompt_document: Optional[dict[str, Any]] = None,
     ) -> Optional[str]:
         """Show the packaged AppKit dialog through JavaScript for Automation."""
         icon_path = PACKAGE_ASSETS_DIR / "agent-asks.icns"
+        document = prompt_document or build_plain_macos_prompt_document(question)
+        document_json = json.dumps(document, ensure_ascii=False).encode()
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -166,15 +183,17 @@ class GUIDialogHandler:
                 "JavaScript",
                 str(MACOS_DIALOG_SCRIPT),
                 self.dialog_title,
-                question,
                 str(icon_path),
                 str(timeout),
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
 
             stdout, _stderr, was_cancelled = await self._communicate_or_cancel(
-                process, cancel_event
+                process,
+                cancel_event,
+                document_json,
             )
             if was_cancelled:
                 return None

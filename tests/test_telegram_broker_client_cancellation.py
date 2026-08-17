@@ -300,7 +300,9 @@ def test_both_mode_local_dialog_win_cancels_real_broker_prompt(
                 *,
                 cancel_event: Optional[asyncio.Event] = None,
                 run_in_thread: bool = False,
+                macos_prompt_document: Optional[dict[str, Any]] = None,
             ) -> Optional[str]:
+                assert macos_prompt_document is not None
                 del cancel_event, run_in_thread
                 await asyncio.wait_for(telegram_client.any_started.wait(), timeout=2)
                 return "local answer"

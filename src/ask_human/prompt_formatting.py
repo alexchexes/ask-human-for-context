@@ -318,6 +318,25 @@ def build_dialog_telegram_notice(platform_name: str) -> str:
     return "📨 Also sent to Telegram."
 
 
+def build_dialog_footer_text(
+    *,
+    timeout_seconds: int,
+    include_timing_info: bool,
+    extra_note: str = "",
+    issued_at: Optional[dt.datetime] = None,
+) -> str:
+    """Build the optional plain-text footer shared by native dialog layouts."""
+    footer_parts = []
+    if extra_note.strip():
+        footer_parts.append(extra_note.strip())
+
+    if include_timing_info:
+        effective_issued_at = issued_at or dt.datetime.now().astimezone()
+        footer_parts.append(build_timing_info_block(effective_issued_at, timeout_seconds))
+
+    return "\n".join(footer_parts)
+
+
 def build_prompt_text(
     question: str,
     context: str,
@@ -338,16 +357,14 @@ def build_prompt_text(
     else:
         full_question = question_block
 
-    footer_parts = []
-    if extra_note.strip():
-        footer_parts.append(extra_note.strip())
-
-    if include_timing_info:
-        effective_issued_at = issued_at or dt.datetime.now().astimezone()
-        footer_parts.append(build_timing_info_block(effective_issued_at, timeout_seconds))
-
-    if footer_parts:
-        return f"{full_question}\n\n{separator}\n" + "\n".join(footer_parts)
+    footer_text = build_dialog_footer_text(
+        timeout_seconds=timeout_seconds,
+        include_timing_info=include_timing_info,
+        extra_note=extra_note,
+        issued_at=issued_at,
+    )
+    if footer_text:
+        return f"{full_question}\n\n{separator}\n{footer_text}"
 
     return full_question
 

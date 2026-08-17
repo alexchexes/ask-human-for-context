@@ -2716,10 +2716,13 @@ def test_tool_uses_telegram_only_mode_without_dialog(monkeypatch):
             return "telegram answer"
 
     class StubDialogHandler:
-        platform = "Linux"
+        platform = "Darwin"
 
         async def get_user_input(self, *args, **kwargs):
             raise AssertionError("Dialog should not be used in telegram mode")
+
+    def fail_macos_prompt_build(*args, **kwargs):
+        raise AssertionError("macOS dialog document should not be built in telegram mode")
 
     stub_telegram = StubTelegramClient()
 
@@ -2728,6 +2731,7 @@ def test_tool_uses_telegram_only_mode_without_dialog(monkeypatch):
     monkeypatch.setattr(server, "response_channel", "telegram")
     monkeypatch.setattr(server, "show_timing_info", False)
     monkeypatch.setattr(server, "dialog_timeout_seconds", 300)
+    monkeypatch.setattr(server, "build_macos_prompt_document", fail_macos_prompt_build)
 
     result = asyncio.run(server.ask_human("Where should I deploy?", "Need a quick answer."))
 
@@ -2739,6 +2743,108 @@ def test_tool_uses_telegram_only_mode_without_dialog(monkeypatch):
     assert stub_telegram.prompt_id.startswith("Q")
     assert stub_telegram.include_timing_info is False
     assert isinstance(stub_telegram.issued_at, dt.datetime)
+
+
+def test_macos_markdown_failure_still_opens_dialog_with_complete_plain_prompt(
+    monkeypatch,
+):
+    """Treat rich formatting as optional at the server-to-dialog boundary."""
+
+    class StubDialogHandler:
+        platform = "Darwin"
+
+        def __init__(self):
+            self.question = None
+            self.document = None
+
+        async def get_user_input(
+            self,
+            question,
+            timeout,
+            *,
+            macos_prompt_document=None,
+        ):
+            self.question = question
+            self.document = macos_prompt_document
+            return "local answer"
+
+    def fail_macos_prompt_build(*args, **kwargs):
+        raise RecursionError("adversarial Markdown nesting")
+
+    stub_dialog = StubDialogHandler()
+    monkeypatch.setattr(server, "dialog_handler", stub_dialog)
+    monkeypatch.setattr(server, "response_channel", "dialog")
+    monkeypatch.setattr(server, "show_timing_info", False)
+    monkeypatch.setattr(server, "dialog_timeout_seconds", 300)
+    monkeypatch.setattr(server, "build_macos_prompt_document", fail_macos_prompt_build)
+
+    result = asyncio.run(server.ask_human("Choose **one**", "Relevant context."))
+
+    assert result == "✅ User reply:\nlocal answer"
+    assert stub_dialog.question is not None
+    assert stub_dialog.document == server.build_plain_macos_prompt_document(stub_dialog.question)
+
+
+def test_macos_markdown_failure_does_not_prevent_telegram_race(monkeypatch):
+    """Start both response channels even when optional Markdown construction fails."""
+
+    class StubTelegramClient:
+        async def ask_question(
+            self,
+            question,
+            context,
+            *,
+            prompt_id,
+            timeout_seconds,
+            include_timing_info,
+            issued_at,
+        ):
+            return "telegram answer"
+
+    class StubDialogHandler:
+        platform = "Darwin"
+
+        def __init__(self):
+            self.document = None
+            self.cancel_event = None
+
+        async def get_user_input(
+            self,
+            question,
+            timeout,
+            *,
+            cancel_event=None,
+            run_in_thread=False,
+            macos_prompt_document=None,
+        ):
+            self.document = macos_prompt_document
+            self.cancel_event = cancel_event
+            assert cancel_event is not None
+            await cancel_event.wait()
+            return None
+
+    def fail_macos_prompt_build(*args, **kwargs):
+        raise RuntimeError("formatting failed")
+
+    stub_dialog = StubDialogHandler()
+    monkeypatch.setattr(server, "telegram_client", StubTelegramClient())
+    monkeypatch.setattr(server, "dialog_handler", stub_dialog)
+    monkeypatch.setattr(server, "response_channel", "both")
+    monkeypatch.setattr(server, "show_timing_info", False)
+    monkeypatch.setattr(server, "dialog_timeout_seconds", 300)
+    monkeypatch.setattr(server, "build_macos_prompt_document", fail_macos_prompt_build)
+
+    result = asyncio.run(server.ask_human("Q?", "Context text."))
+
+    assert result == "✅ Replied via Telegram:\ntelegram answer"
+    assert stub_dialog.cancel_event is not None
+    assert stub_dialog.cancel_event.is_set() is True
+    assert stub_dialog.document is not None
+    assert stub_dialog.document["show_format_toggle"] is False
+    assert (
+        stub_dialog.document["fallback_text"]
+        == stub_dialog.document["rendered_blocks"][0]["spans"][0]["text"]
+    )
 
 
 def test_tool_labels_structured_telegram_reply_by_channel(monkeypatch):

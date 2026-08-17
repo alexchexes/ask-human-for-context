@@ -19,6 +19,10 @@ from .dialogs import (
     UserPromptCancelled,
     UserPromptError,
 )
+from .macos_prompt import (
+    build_macos_prompt_document,
+    build_plain_macos_prompt_document,
+)
 from .prompt_formatting import (
     DEFAULT_DIALOG_TITLE,
     build_dialog_telegram_notice,
@@ -102,6 +106,7 @@ async def _get_first_channel_response(
     timeout_seconds: int,
     prompt_id: str,
     issued_at: dt.datetime,
+    macos_prompt_document: Optional[dict[str, Any]] = None,
 ) -> Optional[tuple[str, str]]:
     """Race dialog and Telegram, returning the first successful response."""
     if telegram_client is None:
@@ -112,12 +117,17 @@ async def _get_first_channel_response(
     should_thread_windows_dialog = dialog_handler.platform == "Windows"
     cancel_event = None if should_thread_windows_dialog else asyncio.Event()
 
+    dialog_arguments: dict[str, Any] = {
+        "cancel_event": cancel_event,
+        "run_in_thread": should_thread_windows_dialog,
+    }
+    if macos_prompt_document is not None:
+        dialog_arguments["macos_prompt_document"] = macos_prompt_document
     dialog_task = asyncio.create_task(
         dialog_handler.get_user_input(
             dialog_prompt,
             timeout_seconds,
-            cancel_event=cancel_event,
-            run_in_thread=should_thread_windows_dialog,
+            **dialog_arguments,
         )
     )
     telegram_task = asyncio.create_task(
@@ -191,10 +201,18 @@ async def get_user_input_from_configured_channel(
     timeout_seconds: int,
     prompt_id: str,
     issued_at: dt.datetime,
+    macos_prompt_document: Optional[dict[str, Any]] = None,
 ) -> Optional[tuple[str, str]]:
     """Use the currently configured response channel(s) to collect user input."""
     if response_channel == "dialog":
-        result = await dialog_handler.get_user_input(dialog_prompt, timeout_seconds)
+        dialog_arguments: dict[str, Any] = {}
+        if macos_prompt_document is not None:
+            dialog_arguments["macos_prompt_document"] = macos_prompt_document
+        result = await dialog_handler.get_user_input(
+            dialog_prompt,
+            timeout_seconds,
+            **dialog_arguments,
+        )
         return None if result is None else ("dialog", result)
 
     if telegram_client is None:
@@ -223,6 +241,7 @@ async def get_user_input_from_configured_channel(
         timeout_seconds,
         prompt_id,
         issued_at,
+        macos_prompt_document,
     )
 
 
@@ -285,6 +304,25 @@ async def ask_human(question: str, context: str = "") -> str:
             extra_note=telegram_notice,
             issued_at=issued_at,
         )
+        macos_prompt_document = None
+        if getattr(dialog_handler, "platform", None) == "Darwin" and response_channel in {
+            "dialog",
+            "both",
+        }:
+            try:
+                macos_prompt_document = build_macos_prompt_document(
+                    question,
+                    context,
+                    fallback_text=dialog_prompt,
+                    timeout_seconds=timeout_seconds,
+                    include_timing_info=show_timing_info,
+                    extra_note=telegram_notice,
+                    issued_at=issued_at,
+                )
+            except Exception:
+                # Markdown presentation is optional; the complete plain prompt must
+                # still reach the dialog (and must not block a Telegram race).
+                macos_prompt_document = build_plain_macos_prompt_document(dialog_prompt)
         # Get user input via the configured channel(s)
         channel_response = await get_user_input_from_configured_channel(
             question,
@@ -293,6 +331,7 @@ async def ask_human(question: str, context: str = "") -> str:
             timeout_seconds,
             prompt_id,
             issued_at,
+            macos_prompt_document,
         )
 
         # Handle different response scenarios with custom exceptions
