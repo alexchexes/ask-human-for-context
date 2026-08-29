@@ -38,11 +38,15 @@ class TelegramBotApiError(TelegramPromptError):
         *,
         method: str,
         http_status: Optional[int] = None,
+        api_error_code: Optional[int] = None,
+        retry_after_seconds: Optional[int] = None,
         transport_error: bool = False,
     ) -> None:
         super().__init__(message)
         self.method = method
         self.http_status = http_status
+        self.api_error_code = api_error_code
+        self.retry_after_seconds = retry_after_seconds
         self.transport_error = transport_error
 
 
@@ -115,6 +119,8 @@ class TelegramPromptClient:
         self._pending_attachment_groups: dict[tuple[int, str], _PendingAttachmentGroup] = {}
         self._active_series_group: Optional[_PendingAttachmentGroup] = None
         self._poller_task: Optional[asyncio.Task[None]] = None
+        self._poll_retry_not_before: Optional[float] = None
+        self._poll_retry_state_changed = asyncio.Event()
         self._poll_sequence = 0
         self._background_status_tasks: set[asyncio.Task[None]] = set()
         self._latest_prompt_message_id: Optional[int] = None
@@ -150,6 +156,7 @@ class TelegramPromptClient:
             for message_id in message_ids:
                 self._pending_by_message_id[message_id] = pending_prompt
             self._latest_prompt_message_id = message_ids[-1]
+            self._poll_retry_state_changed.set()
             self._ensure_poller_locked()
 
         try:
@@ -181,6 +188,7 @@ class TelegramPromptClient:
             self._pending_attachment_groups.clear()
             self._active_series_group = None
             self._latest_prompt_message_id = None
+            self._poll_retry_state_changed.set()
             poller_task = self._poller_task
 
             for pending_prompt in pending_prompts:
@@ -329,6 +337,9 @@ class TelegramPromptClient:
         retry_attempt = 0
         try:
             while True:
+                if not await self._wait_until_poll_retry_allowed():
+                    return
+
                 async with self._lock:
                     has_pending_prompts = bool(self._pending_by_message_id)
                     offset = self._next_update_offset
@@ -368,28 +379,54 @@ class TelegramPromptClient:
                         timeout=http_timeout,
                     )
                 except TelegramPromptError as exc:
+                    now = asyncio.get_running_loop().time()
+                    retry_delay = self._poll_retry_delay(exc, retry_attempt)
+                    is_rate_limit = self._is_poll_rate_limit_error(exc)
+                    if is_rate_limit and retry_delay is not None:
+                        await self._extend_poll_retry_deadline(now + retry_delay)
+
                     if not has_pending_prompts:
                         self._debug_event("telegram_idle_drain_error", error=exc)
                         if await self._should_keep_polling_after_idle_drain():
                             continue
                         return
-                    if has_pending_prompts and self._is_retryable_poll_error(exc):
-                        now = asyncio.get_running_loop().time()
+                    retry_elapsed = None
+                    retry_remaining = None
+                    if has_pending_prompts and retry_delay is not None:
                         if retry_started_at is None:
                             retry_started_at = now
-                        if now - retry_started_at <= self.POLL_RETRY_MAX_ELAPSED_SECONDS:
-                            retry_delay = self._poll_retry_delay(retry_attempt)
+                        retry_elapsed = now - retry_started_at
+                        retry_remaining = self.POLL_RETRY_MAX_ELAPSED_SECONDS - retry_elapsed
+                        if retry_delay <= retry_remaining:
+                            if not is_rate_limit:
+                                await self._extend_poll_retry_deadline(now + retry_delay)
                             self._debug_event(
                                 "telegram_poll_retry",
                                 retry_attempt=retry_attempt + 1,
                                 retry_delay_ms=round(retry_delay * 1000),
-                                retry_elapsed_ms=round((now - retry_started_at) * 1000),
+                                retry_elapsed_ms=round(retry_elapsed * 1000),
+                                retry_budget_remaining_ms=round(max(0.0, retry_remaining) * 1000),
+                                telegram_retry_after_seconds=self._retry_after_seconds(exc),
                                 error=exc,
                             )
-                            await asyncio.sleep(retry_delay)
                             retry_attempt += 1
                             continue
-                    self._debug_event("telegram_poll_error", error=exc)
+                    self._debug_event(
+                        "telegram_poll_error",
+                        retry_delay_ms=(
+                            round(retry_delay * 1000) if retry_delay is not None else None
+                        ),
+                        retry_elapsed_ms=(
+                            round(retry_elapsed * 1000) if retry_elapsed is not None else None
+                        ),
+                        retry_budget_remaining_ms=(
+                            round(max(0.0, retry_remaining) * 1000)
+                            if retry_remaining is not None
+                            else None
+                        ),
+                        telegram_retry_after_seconds=self._retry_after_seconds(exc),
+                        error=exc,
+                    )
                     raise
                 retry_started_at = None
                 retry_attempt = 0
@@ -484,22 +521,87 @@ class TelegramPromptClient:
             self._poller_task = None
             return False
 
+    async def _wait_until_poll_retry_allowed(self) -> bool:
+        """Wait for the active polling backoff, unless no prompt still needs the poller."""
+        while True:
+            async with self._lock:
+                retry_not_before = self._poll_retry_not_before
+                if retry_not_before is None:
+                    return True
+
+                now = asyncio.get_running_loop().time()
+                retry_delay = retry_not_before - now
+                if retry_delay <= 0:
+                    self._poll_retry_not_before = None
+                    return True
+
+                if not self._pending_by_message_id:
+                    self._poller_task = None
+                    return False
+
+                self._poll_retry_state_changed.clear()
+
+            try:
+                await asyncio.wait_for(
+                    self._poll_retry_state_changed.wait(),
+                    timeout=retry_delay,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _extend_poll_retry_deadline(self, retry_not_before: float) -> None:
+        """Preserve the latest deadline before Telegram polling may resume."""
+        async with self._lock:
+            if (
+                self._poll_retry_not_before is None
+                or retry_not_before > self._poll_retry_not_before
+            ):
+                self._poll_retry_not_before = retry_not_before
+            self._poll_retry_state_changed.set()
+
     @classmethod
-    def _poll_retry_delay(cls, retry_attempt: int) -> float:
-        """Return the progressive backoff delay for a retryable poll failure."""
+    def _poll_retry_delay(
+        cls,
+        error: TelegramPromptError,
+        retry_attempt: int,
+    ) -> Optional[float]:
+        """Return the required retry delay for one retryable polling failure."""
+        if not isinstance(error, TelegramBotApiError):
+            return None
+        if error.method != "getUpdates":
+            return None
+
         index = min(retry_attempt, len(cls.POLL_RETRY_DELAYS_SECONDS) - 1)
-        return cls.POLL_RETRY_DELAYS_SECONDS[index]
+        progressive_delay = cls.POLL_RETRY_DELAYS_SECONDS[index]
+
+        if cls._is_poll_rate_limit_error(error):
+            if error.retry_after_seconds is None:
+                return progressive_delay
+            return max(progressive_delay, float(error.retry_after_seconds))
+
+        if error.transport_error:
+            return progressive_delay
+        error_codes = {error.http_status, error.api_error_code}
+        if any(code is not None and 500 <= code < 600 for code in error_codes):
+            return progressive_delay
+        return None
 
     @staticmethod
-    def _is_retryable_poll_error(error: TelegramPromptError) -> bool:
-        """Retry only idempotent Telegram polling failures that are usually transient."""
+    def _retry_after_seconds(error: TelegramPromptError) -> Optional[int]:
+        """Return Telegram's structured flood-wait hint when this error carries one."""
+        if not isinstance(error, TelegramBotApiError):
+            return None
+        return error.retry_after_seconds
+
+    @staticmethod
+    def _is_poll_rate_limit_error(error: TelegramPromptError) -> bool:
+        """Return whether Telegram rate-limited the update poll."""
         if not isinstance(error, TelegramBotApiError):
             return False
-        if error.method != "getUpdates":
-            return False
-        if error.transport_error:
-            return True
-        return error.http_status is not None and 500 <= error.http_status < 600
+        return error.method == "getUpdates" and 429 in {
+            error.http_status,
+            error.api_error_code,
+        }
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         """Process one Telegram update and resolve or reject matching replies."""
@@ -1201,6 +1303,7 @@ class TelegramPromptClient:
 
         if not self._pending_by_message_id:
             self._latest_prompt_message_id = None
+            self._poll_retry_state_changed.set()
         elif self._latest_prompt_message_id in message_ids:
             self._latest_prompt_message_id = max(self._pending_by_message_id)
         return finalize_tasks
@@ -2073,10 +2176,18 @@ class TelegramPromptClient:
                 payload_json = json.load(response)
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
+            error_payload: Any = None
+            try:
+                error_payload = json.loads(error_body)
+            except json.JSONDecodeError:
+                pass
+            api_error_code, retry_after_seconds = self._bot_api_error_metadata(error_payload)
             raise TelegramBotApiError(
                 f"Telegram {method} failed with HTTP {exc.code}: {error_body}",
                 method=method,
                 http_status=exc.code,
+                api_error_code=api_error_code,
+                retry_after_seconds=retry_after_seconds,
             ) from exc
         except OSError as exc:
             raise TelegramBotApiError(
@@ -2086,12 +2197,47 @@ class TelegramPromptClient:
             ) from exc
 
         if not isinstance(payload_json, dict) or not payload_json.get("ok"):
+            api_error_code, retry_after_seconds = self._bot_api_error_metadata(payload_json)
+            description = (
+                payload_json.get("description", "unknown error")
+                if isinstance(payload_json, dict)
+                else "unknown error"
+            )
             raise TelegramBotApiError(
-                f"Telegram {method} failed: {payload_json.get('description', 'unknown error')}",
+                f"Telegram {method} failed: {description}",
                 method=method,
+                api_error_code=api_error_code,
+                retry_after_seconds=retry_after_seconds,
             )
 
         return payload_json.get("result")
+
+    @staticmethod
+    def _bot_api_error_metadata(payload: Any) -> tuple[Optional[int], Optional[int]]:
+        """Extract validated Telegram error-code and flood-wait metadata."""
+        if not isinstance(payload, dict):
+            return None, None
+
+        raw_error_code = payload.get("error_code")
+        api_error_code = (
+            raw_error_code
+            if isinstance(raw_error_code, int) and not isinstance(raw_error_code, bool)
+            else None
+        )
+
+        parameters = payload.get("parameters")
+        if not isinstance(parameters, dict):
+            return api_error_code, None
+
+        raw_retry_after = parameters.get("retry_after")
+        retry_after_seconds = (
+            raw_retry_after
+            if isinstance(raw_retry_after, int)
+            and not isinstance(raw_retry_after, bool)
+            and raw_retry_after >= 0
+            else None
+        )
+        return api_error_code, retry_after_seconds
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[None]) -> None:

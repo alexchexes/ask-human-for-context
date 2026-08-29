@@ -465,7 +465,7 @@ Telegram reply behavior:
 - files are downloaded locally and returned to the agent as local paths
 - if one item in an attachment group is unsupported or too large, the whole group is rejected and the prompt keeps waiting for a valid reply
 - replies that appear intended for another broker instance trigger a warning instead of being silently misrouted
-- transient Telegram polling transport failures and HTTP 5xx responses are retried briefly with backoff; persistent polling failures are returned to the agent as prompt errors
+- transient Telegram polling transport failures, HTTP 5xx responses, and flood-control responses are retried briefly with bounded backoff; Telegram's `retry_after` delay is honored when provided, while persistent polling failures are returned to the agent as prompt errors
 - Telegram delivery failures for the initial question or retry/warning messages are returned to the agent as prompt errors
 
 Replies created with Telegram's Premium Rich Text Editor are not supported yet. The bot asks you to

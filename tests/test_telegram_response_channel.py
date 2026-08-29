@@ -2,6 +2,9 @@
 
 import asyncio
 import datetime as dt
+import io
+import urllib.error
+from email.message import Message
 
 import pytest
 
@@ -155,6 +158,419 @@ def test_telegram_client_retries_transient_get_updates_timeout(monkeypatch, tmp_
     assert result == "proper reply"
     assert poll_calls >= 2
     assert sent_messages[-1]["text"] == "✅ Received [QTEST-1234]"
+
+
+def test_telegram_bot_api_error_preserves_flood_wait_metadata(monkeypatch, tmp_path):
+    """Decode Telegram's structured error metadata from an HTTP failure response."""
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+    error_body = (
+        b'{"ok":false,"error_code":429,"description":"Too Many Requests",'
+        b'"parameters":{"retry_after":5}}'
+    )
+
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            hdrs=Message(),
+            fp=io.BytesIO(error_body),
+        )
+
+    monkeypatch.setattr("ask_human.telegram_client.urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(TelegramBotApiError) as error_info:
+        client._bot_api_request_sync("getUpdates", {"timeout": 25}, 35)
+
+    assert error_info.value.http_status == 429
+    assert error_info.value.api_error_code == 429
+    assert error_info.value.retry_after_seconds == 5
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error_code": 429},
+        {"error_code": 429, "parameters": {}},
+        {"error_code": 429, "parameters": {"retry_after": "5"}},
+        {"error_code": 429, "parameters": {"retry_after": -1}},
+        {"error_code": 429, "parameters": {"retry_after": True}},
+    ],
+)
+def test_telegram_client_uses_normal_backoff_without_valid_retry_after(payload):
+    """Use the existing polling backoff when a rate-limit delay cannot be decoded."""
+    api_error_code, retry_after_seconds = TelegramPromptClient._bot_api_error_metadata(payload)
+    error = TelegramBotApiError(
+        "Telegram getUpdates failed with HTTP 429",
+        method="getUpdates",
+        http_status=429,
+        api_error_code=api_error_code,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+    assert TelegramPromptClient._poll_retry_delay(error, 0) == 1.0
+    assert TelegramPromptClient._poll_retry_delay(error, 1) == 2.0
+
+
+def test_telegram_client_uses_server_flood_wait_for_get_updates_only():
+    """Honor structured 429 delays only in the idempotent update poller."""
+    poll_error = TelegramBotApiError(
+        "Telegram getUpdates failed with HTTP 429",
+        method="getUpdates",
+        http_status=429,
+        api_error_code=429,
+        retry_after_seconds=5,
+    )
+    send_error = TelegramBotApiError(
+        "Telegram sendMessage failed with HTTP 429",
+        method="sendMessage",
+        http_status=429,
+        api_error_code=429,
+        retry_after_seconds=5,
+    )
+
+    assert TelegramPromptClient._poll_retry_delay(poll_error, 0) == 5.0
+    assert TelegramPromptClient._poll_retry_delay(poll_error, 3) == 10.0
+    assert TelegramPromptClient._poll_retry_delay(send_error, 0) is None
+
+
+@pytest.mark.parametrize(
+    ("api_error_code", "retry_after_seconds", "expected_delay"),
+    [
+        (429, 5, 5.0),
+        (500, None, 1.0),
+        (599, None, 1.0),
+    ],
+)
+def test_telegram_client_retries_api_code_only_poll_errors(
+    monkeypatch,
+    tmp_path,
+    api_error_code,
+    retry_after_seconds,
+    expected_delay,
+):
+    """Classify transient API error bodies even when the HTTP status is successful."""
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+    parameters = (
+        f',"parameters":{{"retry_after":{retry_after_seconds}}}'
+        if retry_after_seconds is not None
+        else ""
+    )
+    error_body = (
+        f'{{"ok":false,"error_code":{api_error_code},' f'"description":"poll failed"{parameters}}}'
+    ).encode()
+
+    def fake_urlopen(request, timeout):
+        return io.BytesIO(error_body)
+
+    monkeypatch.setattr("ask_human.telegram_client.urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(TelegramBotApiError) as error_info:
+        client._bot_api_request_sync("getUpdates", {"timeout": 25}, 35)
+
+    assert error_info.value.http_status is None
+    assert error_info.value.api_error_code == api_error_code
+    assert error_info.value.retry_after_seconds == retry_after_seconds
+    assert TelegramPromptClient._poll_retry_delay(error_info.value, 0) == expected_delay
+
+
+def test_telegram_client_retries_get_updates_after_server_flood_wait(monkeypatch, tmp_path):
+    """Resume polling automatically after Telegram's full flood-wait delay."""
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+    poll_calls = 0
+    poll_call_times = []
+
+    async def fake_bot_api_request(method, payload, timeout):
+        nonlocal poll_calls
+        if method == "sendMessage":
+            if "parse_mode" in payload:
+                return {"message_id": 101}
+            return {"message_id": 302}
+        if method == "getUpdates":
+            poll_calls += 1
+            poll_call_times.append(asyncio.get_running_loop().time())
+            if poll_calls == 1:
+                raise TelegramBotApiError(
+                    "Telegram getUpdates failed with HTTP 429",
+                    method="getUpdates",
+                    http_status=429,
+                    api_error_code=429,
+                    retry_after_seconds=1,
+                )
+            if poll_calls == 2:
+                return [
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 210,
+                            "chat": {"id": -1009876543210},
+                            "reply_to_message": {"message_id": 101},
+                            "text": "proper reply",
+                        },
+                    }
+                ]
+            return []
+        raise AssertionError(f"Unexpected Telegram method: {method}")
+
+    monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+    async def run_test():
+        return await asyncio.wait_for(
+            client.ask_question("Prompt text", 3, "QTEST-1234"),
+            timeout=4,
+        )
+
+    result = asyncio.run(run_test())
+
+    assert result == "proper reply"
+    assert poll_call_times[1] - poll_call_times[0] >= 0.9
+
+
+def test_telegram_client_does_not_shorten_flood_wait_to_retry_budget(monkeypatch, tmp_path):
+    """Preserve Telegram's cooldown after the current prompt exhausts its retry budget."""
+    monkeypatch.setattr(TelegramPromptClient, "POLL_RETRY_MAX_ELAPSED_SECONDS", 0.5)
+
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+    poll_calls = 0
+    sent_prompt_count = 0
+    poll_call_times = []
+
+    async def fake_bot_api_request(method, payload, timeout):
+        nonlocal poll_calls, sent_prompt_count
+        if method == "sendMessage":
+            if "parse_mode" in payload:
+                sent_prompt_count += 1
+                return {"message_id": 100 + sent_prompt_count}
+            return {"message_id": 300}
+        if method == "getUpdates":
+            poll_calls += 1
+            poll_call_times.append(asyncio.get_running_loop().time())
+            if poll_calls == 1:
+                raise TelegramBotApiError(
+                    "Telegram getUpdates failed with HTTP 429",
+                    method="getUpdates",
+                    http_status=429,
+                    api_error_code=429,
+                    retry_after_seconds=1,
+                )
+            if poll_calls == 2:
+                return [
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 210,
+                            "chat": {"id": -1009876543210},
+                            "reply_to_message": {"message_id": 102},
+                            "text": "second reply",
+                        },
+                    }
+                ]
+            return []
+        raise AssertionError(f"Unexpected Telegram method: {method}")
+
+    monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+    async def run_test():
+        with pytest.raises(
+            TelegramPromptError,
+            match="Telegram polling failed: Telegram getUpdates failed with HTTP 429",
+        ):
+            await asyncio.wait_for(
+                client.ask_question("First prompt", 3, "QTEST-1234"),
+                timeout=1,
+            )
+
+        return await asyncio.wait_for(
+            client.ask_question("Second prompt", 3, "QTEST-5678"),
+            timeout=3,
+        )
+
+    assert asyncio.run(run_test()) == "second reply"
+    assert poll_calls >= 2
+    assert poll_call_times[1] - poll_call_times[0] >= 0.9
+
+
+@pytest.mark.parametrize(
+    ("error_payload", "minimum_delay"),
+    [
+        ({"error_code": 429}, 0.08),
+        ({"error_code": 429, "parameters": {"retry_after": "1"}}, 0.08),
+        ({"error_code": 429, "parameters": {"retry_after": 0}}, 0.08),
+        ({"error_code": 429, "parameters": {"retry_after": 1}}, 0.9),
+    ],
+)
+def test_telegram_client_preserves_flood_wait_from_idle_drain(
+    monkeypatch,
+    tmp_path,
+    error_payload,
+    minimum_delay,
+):
+    """Delay a prompt that arrives while an idle drain receives a flood wait."""
+    monkeypatch.setattr(TelegramPromptClient, "POLL_RETRY_DELAYS_SECONDS", (0.1,))
+
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+    client._next_update_offset = 1
+    poll_calls = 0
+    idle_poll_started = asyncio.Event()
+    release_idle_poll = asyncio.Event()
+    poll_call_times = []
+    idle_flood_wait_returned_at = None
+
+    async def fake_bot_api_request(method, payload, timeout):
+        nonlocal idle_flood_wait_returned_at, poll_calls
+        if method == "sendMessage":
+            if "parse_mode" in payload:
+                return {"message_id": 101}
+            return {"message_id": 301}
+        if method == "getUpdates":
+            poll_calls += 1
+            poll_call_times.append(asyncio.get_running_loop().time())
+            if poll_calls == 1:
+                idle_poll_started.set()
+                await release_idle_poll.wait()
+                idle_flood_wait_returned_at = asyncio.get_running_loop().time()
+                api_error_code, retry_after_seconds = client._bot_api_error_metadata(error_payload)
+                raise TelegramBotApiError(
+                    "Telegram getUpdates failed with HTTP 429",
+                    method="getUpdates",
+                    http_status=429,
+                    api_error_code=api_error_code,
+                    retry_after_seconds=retry_after_seconds,
+                )
+            if poll_calls == 2:
+                return [
+                    {
+                        "update_id": 2,
+                        "message": {
+                            "message_id": 210,
+                            "chat": {"id": -1009876543210},
+                            "reply_to_message": {"message_id": 101},
+                            "text": "reply after idle flood wait",
+                        },
+                    }
+                ]
+            return []
+        raise AssertionError(f"Unexpected Telegram method: {method}")
+
+    monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+    async def wait_for_pending_prompt():
+        while not client._pending_by_message_id:
+            await asyncio.sleep(0)
+
+    async def run_test():
+        poller_task = asyncio.create_task(client._poll_updates())
+        client._poller_task = poller_task
+        await asyncio.wait_for(idle_poll_started.wait(), timeout=1)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 3, "QTEST-1234"))
+        await asyncio.wait_for(wait_for_pending_prompt(), timeout=1)
+        release_idle_poll.set()
+
+        result = await asyncio.wait_for(prompt_task, timeout=3)
+        await asyncio.wait_for(poller_task, timeout=1)
+        return result
+
+    assert asyncio.run(run_test()) == "reply after idle flood wait"
+    assert idle_flood_wait_returned_at is not None
+    assert poll_call_times[1] - idle_flood_wait_returned_at >= minimum_delay
+
+
+def test_telegram_client_timeout_interrupts_flood_wait(monkeypatch, tmp_path):
+    """Stop a rate-limited poller when its last pending prompt times out."""
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+
+    async def run_test():
+        rate_limit_returned = asyncio.Event()
+
+        async def fake_bot_api_request(method, payload, timeout):
+            if method == "sendMessage":
+                return {"message_id": 101}
+            if method == "getUpdates":
+                rate_limit_returned.set()
+                raise TelegramBotApiError(
+                    "Telegram getUpdates failed with HTTP 429",
+                    method="getUpdates",
+                    http_status=429,
+                    api_error_code=429,
+                    retry_after_seconds=30,
+                )
+            raise AssertionError(f"Unexpected Telegram method: {method}")
+
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 1, "QTEST-1234"))
+        await asyncio.wait_for(rate_limit_returned.wait(), timeout=1)
+
+        assert await asyncio.wait_for(prompt_task, timeout=2) is None
+        for _ in range(20):
+            if client._poller_task is None:
+                break
+            await asyncio.sleep(0)
+        assert client._poller_task is None
+
+    asyncio.run(run_test())
+
+
+def test_telegram_client_shutdown_interrupts_flood_wait(monkeypatch, tmp_path):
+    """Do not leave broker shutdown waiting for a server-directed polling delay."""
+    client = TelegramPromptClient(
+        TelegramConfig("123456:ABCDEF", "-1009876543210"),
+        tmp_path,
+    )
+
+    async def run_test():
+        rate_limit_returned = asyncio.Event()
+
+        async def fake_bot_api_request(method, payload, timeout):
+            if method == "sendMessage":
+                return {"message_id": 101}
+            if method == "getUpdates":
+                rate_limit_returned.set()
+                raise TelegramBotApiError(
+                    "Telegram getUpdates failed with HTTP 429",
+                    method="getUpdates",
+                    http_status=429,
+                    api_error_code=429,
+                    retry_after_seconds=30,
+                )
+            raise AssertionError(f"Unexpected Telegram method: {method}")
+
+        monkeypatch.setattr(client, "_bot_api_request", fake_bot_api_request)
+
+        prompt_task = asyncio.create_task(client.ask_question("Prompt text", 30, "QTEST-1234"))
+        await asyncio.wait_for(rate_limit_returned.wait(), timeout=1)
+
+        async def wait_for_retry_deadline():
+            while client._poll_retry_not_before is None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_retry_deadline(), timeout=1)
+
+        await asyncio.wait_for(client.shutdown(timeout=1), timeout=1)
+        with pytest.raises(TelegramPromptError, match="broker shutdown requested"):
+            await asyncio.wait_for(prompt_task, timeout=1)
+        assert client._poller_task is None
+
+    asyncio.run(run_test())
 
 
 def test_telegram_client_stops_after_poll_retry_budget(monkeypatch, tmp_path):
