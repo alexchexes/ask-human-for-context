@@ -340,6 +340,17 @@ A common source of confusion: the user may think they're on one branch or worksp
 when they're actually on another.
 ```
 
+If your AGENTS.md is long and you place the main Ask Human instruction at the top or in the middle, you may also want to add this small reminder at the very end to reinforce the need to use the tool:
+
+```
+## Ask Human tool usage reminder
+
+Use `ask_human` freely whenever a human would ask a teammate. Do not wait until you are blocked
+to use `ask_human`. When the next step depends on context, preference, confirmation, or choosing
+between reasonable options, or you are simply unsure about something and cannot resolve the
+uncertainty quickly, talk to the user instead of making assumptions.
+```
+
 </details>
 
 Even a carefully written `AGENTS.md` can still hit intrinsic agent limitations: system instructions may override it, or the agent may have learned to provide a "complete solution" instead of asking questions. Whatever the reason, the agent may sometimes ignore the instruction to use this tool in the intended scenarios.
