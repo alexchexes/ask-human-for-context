@@ -12,6 +12,8 @@ Supports Telegram (including files) and local OS dialogs.
 
 It gives MCP-capable agents a focused tool for cases where guessing is the wrong move. The agent can pause, show the question and relevant context, wait for your answer, then continue the same workflow.
 
+Works best with [AGENTS.md guidance](#agentsmd-instructions).
+
 <!-- TOC depthfrom:2 depthto:2 -->
 
 - [Why](#why)
@@ -270,14 +272,30 @@ the `ask_human` tool before proceeding.
 ```md
 ## Ask human tool
 
-If a missing fact, design choice, or user preference is not 100% clear, and a wrong
-assumption could materially affect correctness, safety, architecture, or user intent,
-use the `ask_human` MCP/tool before proceeding.
+The `ask_human` tool lets you talk to the user without ending your turn. Use it as a normal
+collaboration tool, not as a last resort. If a capable teammate who is new to the codebase or
+does not know the relevant context would ask before continuing, do the same.
 
-If the tool is unavailable or times out without a human response, do not proceed
-and do not roll back changes unless it is absolutely necessary (e.g. a broken
-live/production system, runaway resource consumption, etc.). Instead, stop, report
-the current state, repeat the context and question, and let the user answer normally.
+Examples of when it is necessary to use the `ask_human` MCP/tool before proceeding:
+
+- a missing fact, design choice, or user preference is not 100% clear
+- a wrong assumption could affect correctness, safety, architecture, or user intent
+- a wrong assumption could lead to non-trivial work that would later be discarded
+- an exploratory or non-code request is not clear enough to investigate without risking work
+in the wrong direction
+
+First try to discover the needed fact from the available context. If it remains unknown
+or only partially known, ask the user. Do not use guessed defaults, placeholders, or TODOs
+for missing facts that affect the requested output.
+
+Do not wait until you are blocked. Use `ask_human` freely when the next step depends on
+context, preference, confirmation, or a choice between reasonable approaches and the
+uncertainty cannot be resolved quickly.
+
+If the tool is unavailable or times out without a human response, do not proceed and do not
+roll back changes unless it is absolutely necessary (e.g. a broken live/production system,
+runaway resource consumption, etc.). Instead, stop, report the current state, repeat the
+context and question, and let the user answer normally.
 
 If you run `ask_human` through a wrapper that yields intermediate results while waiting,
 never terminate the call until the tool returns a user response or an error, the user
@@ -290,14 +308,24 @@ than finishing a subtask without interruptions.
 Use `ask_human` especially for ambiguous requirements, risky tradeoffs, irreversible
 actions, external side effects, and situations where multiple reasonable approaches
 exist and the preferred one is not 100% clear. Keep the question concise where possible,
-but include necessary context details
-so the user is properly informed.
+but include necessary context details so the user is properly informed. When there are
+a few options, explain the implications of each.
 
 When a task requires many decisions from the user, or when the user explicitly asks
 you to ask questions or use `ask_human`, do not limit that to the initial planning phase.
 Continue talking with the user via that tool during implementation whenever a new assumption,
 design choice, external value, or behavior decision appears that was not already answered.
 Do not treat early answers as broad permission to infer the remaining details silently.
+
+If the original planned approach stops working, do not silently pivot to a materially
+different implementation. If the new path is noticeably more complex than expected,
+depends on a non-obvious mechanism, or introduces tradeoffs the user likely did not ask
+for, briefly explain the issue and ask before proceeding.
+
+For long or complex work, preserve important `ask_human` answers in visible progress
+updates so they survive context compaction. For non-trivial investigations or large
+multi-step tasks, prefer a temporary handoff note that records the current state,
+confirmed decisions, open questions, and next agreed step.
 
 ## Contradictions and questionable requests
 
@@ -314,16 +342,16 @@ when they're actually on another.
 
 </details>
 
-Even a carefully written `AGENTS.md` can still hit intrinsic agent limitations: system instructions may override it, or the agent may have learned to provide a "complete solution" instead of asking questions. Whatever the reason, the agent may sometimes ignore the instruction to use this tool in the intended scenarios (true at least for Codex as of May 2026).
+Even a carefully written `AGENTS.md` can still hit intrinsic agent limitations: system instructions may override it, or the agent may have learned to provide a "complete solution" instead of asking questions. Whatever the reason, the agent may sometimes ignore the instruction to use this tool in the intended scenarios.
 
-To increase the chance that the agent asks before making a wrong assumption, add a reminder like this directly to your prompt when setting a task:
+If, for a specific task, it is absolutely important that the agent ask you without any chance of it "forgetting" the AGENTS.md instruction, add a reminder like this to your prompt:
 
 ```
 ...<your normal prompt>...
 
-P.S. Remember to use the ask_human tool whenever you hit any ambiguity, uncertainty,
+P.S. Remember to use the `ask_human` tool whenever you hit any ambiguity, uncertainty,
 non-obvious implications, something that is not 100% explicitly agreed, or anything
-else that requires or might require my input. Never infer or make assumptions
+else that might require my input. Never infer or make assumptions
 (even "conservative" ones) in such cases; use the `ask_human` tool instead (or stop if
 the tool is unavailable or does not return usable output).
 ```
